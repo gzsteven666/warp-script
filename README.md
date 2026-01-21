@@ -5,8 +5,7 @@
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh](https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh))
-
+bash <(curl -fsSL [https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh]
 特性
 ✅ 自动安装 Cloudflare WARP 官方客户端
 ✅ 配置透明代理，Google 流量自动走 WARP
