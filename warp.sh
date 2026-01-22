@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # WARP 一键脚本（Cloudflare 官方客户端）
-# 让 Google IPv4 流量自动走 WARP（redsocks + iptables + ipset），并阻断 QUIC(UDP/443) 强制回落 TCP
+# Google IPv4 走 WARP：redsocks + iptables + ipset；并阻断 QUIC(UDP/443) 强制回落 TCP
 #
-# 使用：
-#   安装（交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
-#   安装（非交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
-#   卸载（非交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --uninstall
+# 安装（交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
+# 安装（非交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
 #
-# 安装后管理命令：
+# 安装后：
 #   warp status|start|stop|restart|test|ip|update|upgrade|uninstall
 
 set -euo pipefail
 
-#===========================================
-# 配置区
-#===========================================
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-8}"
@@ -25,18 +20,14 @@ REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/gzsteven666/warp
 LOG_FILE="${LOG_FILE:-/var/log/warp-install.log}"
 GAI_MARK="# warp-script: prefer ipv4"
 
-# ipset / iptables 名称
 IPSET_NAME="${IPSET_NAME:-warp_google4}"
 NAT_CHAIN="${NAT_CHAIN:-WARP_GOOGLE}"
 QUIC_CHAIN="${QUIC_CHAIN:-WARP_GOOGLE_QUIC}"
 
-# Google ranges 缓存目录
 CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 
-# 默认静态兜底（当 update 失败/无 python3 时仍可工作）
-# 你可以按需继续补充，但强烈建议用 `warp update` 走官方 JSON 自动更新
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
@@ -61,28 +52,17 @@ STATIC_GOOGLE_IPV4_CIDRS="
 216.239.32.0/19
 "
 
-#===========================================
-# 颜色定义
-#===========================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-#===========================================
-# 工具函数
-#===========================================
 info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
 success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
-
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { error "缺少依赖命令：$1"; return 1; }
-}
 
 check_root() {
   [[ ${EUID:-0} -ne 0 ]] && { error "请使用 root 运行！"; exit 1; }
@@ -99,9 +79,6 @@ show_banner() {
   echo -e "${NC}"
 }
 
-#===========================================
-# 系统检测
-#===========================================
 OS=""
 VERSION=""
 CODENAME=""
@@ -118,7 +95,6 @@ detect_system() {
     exit 1
   fi
 
-  # CODENAME 兜底（Ubuntu/Debian 需要）
   if [[ -z "${CODENAME}" ]]; then
     CODENAME="$(lsb_release -cs 2>/dev/null || true)"
   fi
@@ -144,18 +120,15 @@ detect_system() {
 
 warn_firewall_backend() {
   if systemctl is-active firewalld >/dev/null 2>&1; then
-    warn "检测到 firewalld 正在运行，可能会冲掉你写入的 iptables 规则。若遇到规则失效，请考虑关闭 firewalld 或改用 direct rules。"
+    warn "检测到 firewalld 正在运行，可能会冲掉 iptables 规则。若遇到规则失效，请考虑关闭 firewalld 或改用 direct rules。"
   fi
   if iptables -V 2>/dev/null | grep -qi "nf_tables"; then
-    warn "检测到 iptables 使用 nf_tables backend（兼容层）。一般可用，但若遇到规则异常，可能需要改用 nft 原生写法。"
+    warn "检测到 iptables 使用 nf_tables backend（兼容层）。一般可用，但若规则异常，可能需要改用 nft 原生写法。"
   fi
 }
 
-#===========================================
-# 安装/配置 WARP 与依赖
-#===========================================
 install_prereqs() {
-  info "安装基础依赖（curl/ca-certificates 等）..."
+  info "安装依赖（curl/ca-certificates/ipset/iptables 等）..."
   case "${OS}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
@@ -178,22 +151,18 @@ install_prereqs() {
 
 install_warp_client() {
   if command -v warp-cli >/dev/null 2>&1; then
-    success "已检测到 warp-cli，跳过安装 WARP 客户端"
+    success "已检测到 warp-cli，跳过安装 WARP"
   else
-    info "安装 Cloudflare WARP 客户端..."
+    info "安装 Cloudflare WARP..."
     case "${OS}" in
       ubuntu|debian)
         export DEBIAN_FRONTEND=noninteractive
         local arch
         arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-
         mkdir -p /usr/share/keyrings
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
-        if [[ -z "${CODENAME}" ]]; then
-          error "无法获取系统代号 CODENAME（Ubuntu/Debian）"
-          return 1
-        fi
+        [[ -z "${CODENAME}" ]] && { error "无法获取 CODENAME"; return 1; }
 
         echo "deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" \
           > /etc/apt/sources.list.d/cloudflare-client.list
@@ -223,14 +192,11 @@ EOF
     esac
   fi
 
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    error "WARP 安装失败：找不到 warp-cli"
-    return 1
-  fi
+  command -v warp-cli >/dev/null 2>&1 || { error "WARP 安装失败：未找到 warp-cli"; return 1; }
 
-  info "启用并启动 warp-svc..."
+  info "启动 warp-svc..."
   systemctl enable --now warp-svc >/dev/null 2>&1 || true
-  success "WARP 客户端已就绪"
+  success "WARP 就绪"
 }
 
 install_redsocks() {
@@ -244,21 +210,20 @@ install_redsocks() {
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y redsocks >/dev/null 2>&1 || { error "redsocks 安装失败"; return 1; }
+      apt-get install -y redsocks >/dev/null 2>&1
       ;;
     centos|rhel|rocky|almalinux|fedora)
-      # redsocks 很多时候需要 EPEL
       if command -v dnf >/dev/null 2>&1; then
         dnf install -y redsocks >/dev/null 2>&1 || {
-          warn "redsocks 可能需要 EPEL，尝试安装 epel-release..."
+          warn "尝试安装 epel-release..."
           dnf install -y epel-release >/dev/null 2>&1 || true
-          dnf install -y redsocks >/dev/null 2>&1 || { error "redsocks 安装失败（可能缺少 EPEL）"; return 1; }
+          dnf install -y redsocks >/dev/null 2>&1
         }
       else
         yum install -y redsocks >/dev/null 2>&1 || {
-          warn "redsocks 可能需要 EPEL，尝试安装 epel-release..."
+          warn "尝试安装 epel-release..."
           yum install -y epel-release >/dev/null 2>&1 || true
-          yum install -y redsocks >/dev/null 2>&1 || { error "redsocks 安装失败（可能缺少 EPEL）"; return 1; }
+          yum install -y redsocks >/dev/null 2>&1
         }
       fi
       ;;
@@ -268,31 +233,22 @@ install_redsocks() {
       ;;
   esac
 
-  command -v redsocks >/dev/null 2>&1 || { error "redsocks 安装后仍不可用"; return 1; }
+  command -v redsocks >/dev/null 2>&1 || { error "redsocks 安装失败"; return 1; }
   success "redsocks 已安装"
 }
 
 configure_warp() {
   info "注册/配置 WARP..."
-  # 尽量兼容不同版本
   warp-cli --accept-tos registration new >/dev/null 2>&1 || warp-cli --accept-tos register >/dev/null 2>&1 || true
-
-  # 关键：Proxy mode 建议使用 MASQUE
   warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 || warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
-
   warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli mode proxy >/dev/null 2>&1 || true
   warp-cli --accept-tos proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || warp-cli proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || true
-
   warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
   sleep 2
-
-  local st
-  st="$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null || true)"
-  info "WARP 状态：${st:-未知}"
+  info "WARP 状态：$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null || echo 未知)"
 }
 
 setup_gai_conf() {
-  # 让 IPv4 优先（避免部分环境 IPv6 解析导致连接异常）
   if ! grep -qF "${GAI_MARK}" /etc/gai.conf 2>/dev/null; then
     {
       echo "${GAI_MARK}"
@@ -326,9 +282,6 @@ EOF
   success "redsocks 配置完成"
 }
 
-#===========================================
-# 生成 /usr/local/bin/warp-google（ipset 版）
-#===========================================
 write_warp_google() {
   info "创建 /usr/local/bin/warp-google（ipset 版）..."
   mkdir -p "${CACHE_DIR}"
@@ -399,7 +352,6 @@ load_ipv4_list() {
 ipset_apply() {
   ensure_ipset
   ipset flush "${IPSET_NAME}" || true
-
   local cidr
   while IFS= read -r cidr; do
     [[ -z "${cidr}" ]] && continue
@@ -408,7 +360,6 @@ ipset_apply() {
 }
 
 iptables_apply() {
-  # NAT：TCP 重定向到 redsocks
   iptables -t nat -N "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -F "${NAT_CHAIN}"
 
@@ -417,7 +368,6 @@ iptables_apply() {
 
   iptables -t nat -C OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || iptables -t nat -I OUTPUT 1 -j "${NAT_CHAIN}"
 
-  # FILTER：阻断 QUIC（UDP/443）强制回落 TCP
   iptables -t filter -N "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -F "${QUIC_CHAIN}"
 
@@ -492,7 +442,6 @@ for p in data.get("prefixes",[]):
 print("\n".join(sorted(set(out))))
 PY
   else
-    # 无 python3：粗暴 grep 兜底（可能不够严谨，但总比没有好）
     grep -oE '"ipv4Prefix"\s*:\s*"[^"]+"' "${tmp}" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u > "${IPV4_CACHE_FILE}"
   fi
 
@@ -504,7 +453,7 @@ PY
   fi
 
   info "已更新缓存：${IPV4_CACHE_FILE}（$(wc -l < "${IPV4_CACHE_FILE}") 条）"
-  info "重载 ipset 并重启透明代理..."
+  info "重启透明代理..."
   stop || true
   start
 }
@@ -526,7 +475,7 @@ SCRIPT
 }
 
 write_systemd_service() {
-  info "创建/更新 systemd 服务 warp-google.service..."
+  info "创建/更新 warp-google.service..."
   cat > /etc/systemd/system/warp-google.service <<EOF
 [Unit]
 Description=WARP Google Transparent Proxy (ipset)
@@ -548,11 +497,8 @@ EOF
   success "warp-google 服务已启用"
 }
 
-#===========================================
-# 生成 /usr/local/bin/warp（管理脚本 + upgrade）
-#===========================================
 write_warp_cli() {
-  info "创建 /usr/local/bin/warp 管理命令..."
+  info "创建 /usr/local/bin/warp（管理命令 + upgrade）..."
   cat > /usr/local/bin/warp <<'WARPSCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -618,7 +564,6 @@ do_upgrade() {
     exit 1
   fi
   chmod +x "${tmp}"
-  # 非交互覆盖升级
   bash "${tmp}" --install
   rm -f "${tmp}"
   echo "[warp] 升级完成。"
@@ -641,7 +586,6 @@ do_uninstall() {
 
   systemctl daemon-reload 2>/dev/null || true
 
-  # 清理 iptables
   iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null || true
   iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
   iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
@@ -650,13 +594,9 @@ do_uninstall() {
   iptables -t filter -F WARP_GOOGLE_QUIC 2>/dev/null || true
   iptables -t filter -X WARP_GOOGLE_QUIC 2>/dev/null || true
 
-  # 清理 ipset
   ipset destroy warp_google4 2>/dev/null || true
-
-  # 回滚 gai.conf
   sed -i "/$GAI_MARK/,+1d" /etc/gai.conf 2>/dev/null || true
 
-  # 卸载软件包
   case "${OS_ID}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
@@ -676,30 +616,18 @@ do_uninstall() {
 }
 
 case "${1:-}" in
-  status)   do_status ;;
-  start)    do_start ;;
-  stop)     do_stop ;;
-  restart)  do_restart ;;
-  test)     do_test ;;
-  ip)       do_ip ;;
-  update)   do_update ;;
-  upgrade)  do_upgrade ;;
+  status) do_status ;;
+  start) do_start ;;
+  stop) do_stop ;;
+  restart) do_restart ;;
+  test) do_test ;;
+  ip) do_ip ;;
+  update) do_update ;;
+  upgrade) do_upgrade ;;
   uninstall) do_uninstall ;;
   *)
-    echo "WARP 管理工具"
-    echo ""
     echo "用法: warp <命令>"
-    echo ""
-    echo "命令:"
-    echo "  status     查看状态"
-    echo "  start      启动 WARP + 透明代理"
-    echo "  stop       停止透明代理 + 断开 WARP"
-    echo "  restart    重启"
-    echo "  test       测试 Google + WARP Trace"
-    echo "  ip         查看直连/WARP IP"
-    echo "  update     更新 Google IP 段（官方 JSON）"
-    echo "  upgrade    一键升级到最新脚本版本"
-    echo "  uninstall  卸载"
+    echo "  status | start | stop | restart | test | ip | update | upgrade | uninstall"
     ;;
 esac
 WARPSCRIPT
@@ -707,12 +635,9 @@ WARPSCRIPT
   success "warp 管理命令已创建"
 }
 
-#===========================================
-# 安装 / 卸载 / 状态（主脚本）
-#===========================================
 do_install() {
   info "开始安装/覆盖升级 v${SCRIPT_VERSION} ..."
-  log "========== 开始安装/升级 v${SCRIPT_VERSION} =========="
+  log "========== install/upgrade v${SCRIPT_VERSION} =========="
 
   install_prereqs
   warn_firewall_backend
@@ -727,17 +652,17 @@ do_install() {
   write_systemd_service
   write_warp_cli
 
-  # 尝试拉一次最新 Google 段（失败也不阻塞安装）
+  configure_warp
+
   if /usr/local/bin/warp-google update >/dev/null 2>&1; then
     success "Google IP 段已更新到最新（goog.json）"
   else
     warn "Google IP 段更新失败（将使用静态兜底段）。你可稍后执行：warp update"
+    systemctl restart warp-google >/dev/null 2>&1 || true
   fi
 
   success "安装/升级完成！"
-  echo ""
   echo -e "管理命令：${GREEN}warp status | warp test | warp update | warp upgrade${NC}"
-  echo ""
 }
 
 do_uninstall() {
@@ -745,7 +670,6 @@ do_uninstall() {
     warp uninstall
     return 0
   fi
-
   warn "未检测到 /usr/local/bin/warp，执行简化卸载..."
 
   systemctl disable --now warp-google 2>/dev/null || true
@@ -758,39 +682,26 @@ do_uninstall() {
   rm -rf /etc/warp-google
 
   systemctl daemon-reload 2>/dev/null || true
-
-  iptables -t nat -D OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
-
-  iptables -t filter -D OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
-
   ipset destroy "${IPSET_NAME}" 2>/dev/null || true
   sed -i "/$GAI_MARK/,+1d" /etc/gai.conf 2>/dev/null || true
 
-  success "卸载完成（残留包可手动移除 cloudflare-warp/redsocks）"
+  success "卸载完成"
 }
 
 do_status() {
   if command -v warp >/dev/null 2>&1; then
     warp status
-    return 0
+  else
+    echo "未安装。执行：--install"
   fi
-  echo "未安装 warp 管理命令。你可以先执行安装：--install"
 }
 
-#===========================================
-# 菜单
-#===========================================
 show_menu() {
   echo -e "${YELLOW}请选择操作:${NC}\n"
   echo -e "  ${GREEN}1.${NC} 安装/升级 WARP（ipset版）"
   echo -e "  ${GREEN}2.${NC} 卸载"
   echo -e "  ${GREEN}3.${NC} 查看状态"
   echo -e "  ${GREEN}0.${NC} 退出\n"
-
   read -r -p "请输入选项 [0-3]: " choice
   case "${choice}" in
     1) do_install ;;
@@ -805,7 +716,6 @@ main() {
   check_root
   detect_system
 
-  # 非交互参数
   case "${1:-}" in
     --install|install) show_banner; do_install; exit 0 ;;
     --uninstall|uninstall) show_banner; do_uninstall; exit 0 ;;
