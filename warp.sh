@@ -2,21 +2,25 @@
 # WARP 一键脚本（Cloudflare 官方客户端）
 # Google IPv4 走 WARP：redsocks + iptables + ipset；并阻断 QUIC(UDP/443) 强制回落 TCP
 #
-# 安装（交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
-# 安装（非交互）: bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
+# 安装（交互）:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 #
-# 安装后：
+# 安装（非交互）:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
+#
+# 安装后管理命令：
 #   warp status|start|stop|restart|test|ip|update|upgrade|uninstall
 
 set -euo pipefail
 
+#========================
+# 配置
+#========================
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
-REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-8}"
+SCRIPT_VERSION="1.3.1"
 
-SCRIPT_VERSION="1.3.0"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh}"
-
 LOG_FILE="${LOG_FILE:-/var/log/warp-install.log}"
 GAI_MARK="# warp-script: prefer ipv4"
 
@@ -28,6 +32,7 @@ CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 
+# 静态兜底（update 失败时仍可用）
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
@@ -52,6 +57,9 @@ STATIC_GOOGLE_IPV4_CIDRS="
 216.239.32.0/19
 "
 
+#========================
+# 颜色
+#========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -69,7 +77,7 @@ check_root() {
 }
 
 show_banner() {
-  clear || true
+  clear 2>/dev/null || true
   echo -e "${CYAN}"
   echo "╔════════════════════════════════════════════════════╗"
   echo "║ 🌐 WARP 一键脚本 - Google 自动解锁（ipset版） 🌐 ║"
@@ -79,6 +87,9 @@ show_banner() {
   echo -e "${NC}"
 }
 
+#========================
+# 系统检测
+#========================
 OS=""
 VERSION=""
 CODENAME=""
@@ -127,19 +138,22 @@ warn_firewall_backend() {
   fi
 }
 
+#========================
+# 依赖安装
+#========================
 install_prereqs() {
   info "安装依赖（curl/ca-certificates/ipset/iptables 等）..."
   case "${OS}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset >/dev/null 2>&1
+      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 >/dev/null 2>&1
       ;;
     centos|rhel|rocky|almalinux|fedora)
       if command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl ca-certificates iptables ipset >/dev/null 2>&1 || true
+        dnf install -y curl ca-certificates iptables ipset python3 >/dev/null 2>&1 || true
       else
-        yum install -y curl ca-certificates iptables ipset >/dev/null 2>&1 || true
+        yum install -y curl ca-certificates iptables ipset python3 >/dev/null 2>&1 || true
       fi
       ;;
     *)
@@ -159,10 +173,11 @@ install_warp_client() {
         export DEBIAN_FRONTEND=noninteractive
         local arch
         arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+
         mkdir -p /usr/share/keyrings
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
-        [[ -z "${CODENAME}" ]] && { error "无法获取 CODENAME"; return 1; }
+        [[ -z "${CODENAME}" ]] && { error "无法获取系统代号 CODENAME"; return 1; }
 
         echo "deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" \
           > /etc/apt/sources.list.d/cloudflare-client.list
@@ -282,6 +297,9 @@ EOF
   success "redsocks 配置完成"
 }
 
+#========================
+# 生成 /usr/local/bin/warp-google（ipset 版）
+#========================
 write_warp_google() {
   info "创建 /usr/local/bin/warp-google（ipset 版）..."
   mkdir -p "${CACHE_DIR}"
@@ -333,7 +351,7 @@ warp_connect() {
 
 start_redsocks() {
   pkill redsocks 2>/dev/null || true
-  sleep 0.5
+  sleep 0.3
   redsocks -c /etc/redsocks.conf
 }
 
@@ -352,7 +370,6 @@ load_ipv4_list() {
 ipset_apply() {
   ensure_ipset
   ipset flush "${IPSET_NAME}" || true
-  local cidr
   while IFS= read -r cidr; do
     [[ -z "${cidr}" ]] && continue
     ipset add "${IPSET_NAME}" "${cidr}" -exist
@@ -360,20 +377,16 @@ ipset_apply() {
 }
 
 iptables_apply() {
+  # NAT：TCP 重定向到 redsocks
   iptables -t nat -N "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -F "${NAT_CHAIN}"
-
-  iptables -t nat -A "${NAT_CHAIN}" -p tcp -m set --match-set "${IPSET_NAME}" dst \
-    -j REDIRECT --to-ports "${REDSOCKS_PORT}"
-
+  iptables -t nat -A "${NAT_CHAIN}" -p tcp -m set --match-set "${IPSET_NAME}" dst -j REDIRECT --to-ports "${REDSOCKS_PORT}"
   iptables -t nat -C OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || iptables -t nat -I OUTPUT 1 -j "${NAT_CHAIN}"
 
+  # FILTER：阻断 QUIC（UDP/443）
   iptables -t filter -N "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -F "${QUIC_CHAIN}"
-
-  iptables -t filter -A "${QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "${IPSET_NAME}" dst \
-    -j REJECT
-
+  iptables -t filter -A "${QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "${IPSET_NAME}" dst -j REJECT
   iptables -t filter -C OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || iptables -t filter -I OUTPUT 1 -j "${QUIC_CHAIN}"
 }
 
@@ -408,7 +421,7 @@ status() {
   echo "=== Redsocks ==="
   pgrep -x redsocks >/dev/null && echo "运行中" || echo "未运行"
   echo ""
-  echo "=== ipset（${IPSET_NAME}）=== "
+  echo "=== ipset（${IPSET_NAME}）==="
   ipset list "${IPSET_NAME}" 2>/dev/null | awk 'NR==1 || NR==2 || $1=="Number" || $1=="Members:" {print}' || echo "未创建"
   echo ""
   echo "=== NAT 规则（命中计数）==="
@@ -424,11 +437,7 @@ update() {
 
   local tmp
   tmp="$(mktemp)"
-  if ! curl -fsSL "${GOOG_JSON_URL}" -o "${tmp}"; then
-    rm -f "${tmp}"
-    echo "下载失败：${GOOG_JSON_URL}" >&2
-    return 1
-  fi
+  curl -fsSL "${GOOG_JSON_URL}" -o "${tmp}"
 
   if command -v python3 >/dev/null 2>&1; then
     python3 - <<PY > "${IPV4_CACHE_FILE}"
@@ -447,10 +456,7 @@ PY
 
   rm -f "${tmp}"
 
-  if [[ ! -s "${IPV4_CACHE_FILE}" ]]; then
-    echo "更新失败：未解析到 IPv4 段" >&2
-    return 1
-  fi
+  [[ -s "${IPV4_CACHE_FILE}" ]] || { echo "更新失败：未解析到 IPv4 段" >&2; return 1; }
 
   info "已更新缓存：${IPV4_CACHE_FILE}（$(wc -l < "${IPV4_CACHE_FILE}") 条）"
   info "重启透明代理..."
@@ -461,7 +467,7 @@ PY
 case "${1:-}" in
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 0.5; start ;;
+  restart) stop; sleep 0.3; start ;;
   status) status ;;
   update) update ;;
   *)
@@ -497,8 +503,11 @@ EOF
   success "warp-google 服务已启用"
 }
 
+#========================
+# 生成 /usr/local/bin/warp（含 upgrade）
+#========================
 write_warp_cli() {
-  info "创建 /usr/local/bin/warp（管理命令 + upgrade）..."
+  info "创建 /usr/local/bin/warp（管理命令）..."
   cat > /usr/local/bin/warp <<'WARPSCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -558,11 +567,7 @@ do_upgrade() {
   echo "[warp] 正在自升级：下载最新脚本并覆盖升级..."
   local tmp
   tmp="$(mktemp)"
-  if ! curl -fsSL "${REPO_RAW_URL}" -o "${tmp}"; then
-    echo "[warp] 下载失败：${REPO_RAW_URL}" >&2
-    rm -f "${tmp}"
-    exit 1
-  fi
+  curl -fsSL "${REPO_RAW_URL}" -o "${tmp}"
   chmod +x "${tmp}"
   bash "${tmp}" --install
   rm -f "${tmp}"
@@ -631,10 +636,14 @@ case "${1:-}" in
     ;;
 esac
 WARPSCRIPT
+
   chmod +x /usr/local/bin/warp
   success "warp 管理命令已创建"
 }
 
+#========================
+# 安装/卸载/状态
+#========================
 do_install() {
   info "开始安装/覆盖升级 v${SCRIPT_VERSION} ..."
   log "========== install/upgrade v${SCRIPT_VERSION} =========="
@@ -668,24 +677,9 @@ do_install() {
 do_uninstall() {
   if command -v warp >/dev/null 2>&1; then
     warp uninstall
-    return 0
+  else
+    warn "未检测到 warp 管理命令，跳过。"
   fi
-  warn "未检测到 /usr/local/bin/warp，执行简化卸载..."
-
-  systemctl disable --now warp-google 2>/dev/null || true
-  systemctl disable --now warp-svc 2>/dev/null || true
-
-  rm -f /etc/systemd/system/warp-google.service
-  rm -f /usr/local/bin/warp-google
-  rm -f /usr/local/bin/warp
-  rm -f /etc/redsocks.conf
-  rm -rf /etc/warp-google
-
-  systemctl daemon-reload 2>/dev/null || true
-  ipset destroy "${IPSET_NAME}" 2>/dev/null || true
-  sed -i "/$GAI_MARK/,+1d" /etc/gai.conf 2>/dev/null || true
-
-  success "卸载完成"
 }
 
 do_status() {
@@ -712,18 +706,30 @@ show_menu() {
   esac
 }
 
+#========================
+# ✅ 关键：main() 绝对可靠
+#========================
 main() {
   check_root
   detect_system
 
   case "${1:-}" in
-    --install|install) show_banner; do_install; exit 0 ;;
-    --uninstall|uninstall) show_banner; do_uninstall; exit 0 ;;
-    --status|status) do_status; exit 0 ;;
+    --install|install)
+      show_banner
+      do_install
+      ;;
+    --uninstall|uninstall)
+      show_banner
+      do_uninstall
+      ;;
+    --status|status)
+      do_status
+      ;;
+    *)
+      show_banner
+      show_menu
+      ;;
   esac
-
-  show_banner
-  show_menu
 }
 
 main "$@"
