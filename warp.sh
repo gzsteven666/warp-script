@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
-# WARP 一键脚本（Cloudflare 官方客户端）
-# Google IPv4 走 WARP：redsocks + iptables + ipset；并阻断 QUIC(UDP/443) 强制回落 TCP
+# WARP Script - Google unlock via Cloudflare WARP (ipset)
+# Author: gzsteven666 (repo) + improvements
 #
-# 安装（交互）:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
+# Usage:
+#   Interactive:
+#     bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
+#   Non-interactive install/upgrade:
+#     bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
 #
-# 安装（非交互）:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
-#
-# 安装后管理命令：
+# After install:
 #   warp status|start|stop|restart|test|ip|update|upgrade|uninstall
 
 set -euo pipefail
 
 #========================
-# 配置
+# Config
 #========================
+SCRIPT_VERSION="1.3.2"
+
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
-SCRIPT_VERSION="1.3.1"
 
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh}"
 LOG_FILE="${LOG_FILE:-/var/log/warp-install.log}"
-GAI_MARK="# warp-script: prefer ipv4"
 
+GAI_MARK="# warp-script: prefer ipv4"
 IPSET_NAME="${IPSET_NAME:-warp_google4}"
 NAT_CHAIN="${NAT_CHAIN:-WARP_GOOGLE}"
 QUIC_CHAIN="${QUIC_CHAIN:-WARP_GOOGLE_QUIC}"
@@ -32,7 +33,7 @@ CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 
-# 静态兜底（update 失败时仍可用）
+# Static fallback (only used if update fails)
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
@@ -58,7 +59,7 @@ STATIC_GOOGLE_IPV4_CIDRS="
 "
 
 #========================
-# 颜色
+# Colors
 #========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -80,15 +81,14 @@ show_banner() {
   clear 2>/dev/null || true
   echo -e "${CYAN}"
   echo "╔════════════════════════════════════════════════════╗"
-  echo "║ 🌐 WARP 一键脚本 - Google 自动解锁（ipset版） 🌐 ║"
-  echo "║ 使用 Cloudflare 官方客户端                          ║"
+  echo "║ 🌐 WARP Script - Google Unlock (ipset)            ║"
   echo "║ v${SCRIPT_VERSION}                                  ║"
   echo "╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
 
 #========================
-# 系统检测
+# OS detect
 #========================
 OS=""
 VERSION=""
@@ -139,21 +139,21 @@ warn_firewall_backend() {
 }
 
 #========================
-# 依赖安装
+# Install deps
 #========================
 install_prereqs() {
-  info "安装依赖（curl/ca-certificates/ipset/iptables 等）..."
+  info "安装依赖（curl/ca-certificates/ipset/iptables/python3 等）..."
   case "${OS}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 >/dev/null 2>&1
+      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 redsocks >/dev/null 2>&1
       ;;
     centos|rhel|rocky|almalinux|fedora)
       if command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl ca-certificates iptables ipset python3 >/dev/null 2>&1 || true
+        dnf install -y curl ca-certificates iptables ipset python3 redsocks >/dev/null 2>&1 || true
       else
-        yum install -y curl ca-certificates iptables ipset python3 >/dev/null 2>&1 || true
+        yum install -y curl ca-certificates iptables ipset python3 redsocks >/dev/null 2>&1 || true
       fi
       ;;
     *)
@@ -214,44 +214,6 @@ EOF
   success "WARP 就绪"
 }
 
-install_redsocks() {
-  if command -v redsocks >/dev/null 2>&1; then
-    success "已检测到 redsocks，跳过安装"
-    return 0
-  fi
-
-  info "安装 redsocks..."
-  case "${OS}" in
-    ubuntu|debian)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y redsocks >/dev/null 2>&1
-      ;;
-    centos|rhel|rocky|almalinux|fedora)
-      if command -v dnf >/dev/null 2>&1; then
-        dnf install -y redsocks >/dev/null 2>&1 || {
-          warn "尝试安装 epel-release..."
-          dnf install -y epel-release >/dev/null 2>&1 || true
-          dnf install -y redsocks >/dev/null 2>&1
-        }
-      else
-        yum install -y redsocks >/dev/null 2>&1 || {
-          warn "尝试安装 epel-release..."
-          yum install -y epel-release >/dev/null 2>&1 || true
-          yum install -y redsocks >/dev/null 2>&1
-        }
-      fi
-      ;;
-    *)
-      error "不支持的系统：${OS}"
-      return 1
-      ;;
-  esac
-
-  command -v redsocks >/dev/null 2>&1 || { error "redsocks 安装失败"; return 1; }
-  success "redsocks 已安装"
-}
-
 configure_warp() {
   info "注册/配置 WARP..."
   warp-cli --accept-tos registration new >/dev/null 2>&1 || warp-cli --accept-tos register >/dev/null 2>&1 || true
@@ -259,7 +221,7 @@ configure_warp() {
   warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli mode proxy >/dev/null 2>&1 || true
   warp-cli --accept-tos proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || warp-cli proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || true
   warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
-  sleep 2
+  sleep 1
   info "WARP 状态：$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null || echo 未知)"
 }
 
@@ -270,8 +232,6 @@ setup_gai_conf() {
       echo "precedence ::ffff:0:0/96  100"
     } >> /etc/gai.conf
     success "已写入 /etc/gai.conf（带标记，可回滚）"
-  else
-    info "/etc/gai.conf 已存在标记，跳过"
   fi
 }
 
@@ -285,7 +245,6 @@ base {
   daemon = on;
   redirector = iptables;
 }
-
 redsocks {
   local_ip = 127.0.0.1;
   local_port = ${REDSOCKS_PORT};
@@ -298,388 +257,239 @@ EOF
 }
 
 #========================
-# 生成 /usr/local/bin/warp-google（ipset 版）
+# /usr/local/bin/warp-google (ipset)
 #========================
 write_warp_google() {
   info "创建 /usr/local/bin/warp-google（ipset 版）..."
   mkdir -p "${CACHE_DIR}"
 
-  cat > /usr/local/bin/warp-google <<'SCRIPT'
+  cat > /usr/local/bin/warp-google <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
-REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
+WARP_PROXY_PORT="${WARP_PROXY_PORT}"
+REDSOCKS_PORT="${REDSOCKS_PORT}"
 
-IPSET_NAME="${IPSET_NAME:-warp_google4}"
-NAT_CHAIN="${NAT_CHAIN:-WARP_GOOGLE}"
-QUIC_CHAIN="${QUIC_CHAIN:-WARP_GOOGLE_QUIC}"
+IPSET_NAME="${IPSET_NAME}"
+NAT_CHAIN="${NAT_CHAIN}"
+QUIC_CHAIN="${QUIC_CHAIN}"
 
-CACHE_DIR="/etc/warp-google"
-GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
-IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
+CACHE_DIR="${CACHE_DIR}"
+GOOG_JSON_URL="${GOOG_JSON_URL}"
+IPV4_CACHE_FILE="${IPV4_CACHE_FILE}"
 
-STATIC_GOOGLE_IPV4_CIDRS="
-8.8.4.0/24
-8.8.8.0/24
-34.0.0.0/9
-35.184.0.0/13
-35.192.0.0/12
-35.224.0.0/12
-35.240.0.0/13
-64.233.160.0/19
-66.102.0.0/20
-66.249.64.0/19
-72.14.192.0/18
-74.125.0.0/16
-104.132.0.0/14
-108.177.0.0/17
-142.250.0.0/15
-172.217.0.0/16
-172.253.0.0/16
-173.194.0.0/16
-209.85.128.0/17
-216.58.192.0/19
-216.239.32.0/19
-"
+STATIC_GOOGLE_IPV4_CIDRS='${STATIC_GOOGLE_IPV4_CIDRS}'
 
-info() { echo "[warp-google] $*"; }
+info() { echo "[warp-google] \$*"; }
 
-warp_connect() {
-  warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true
-}
+warp_connect() { warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true; }
 
 start_redsocks() {
   pkill redsocks 2>/dev/null || true
-  sleep 0.3
+  sleep 0.2
   redsocks -c /etc/redsocks.conf
 }
 
-ensure_ipset() {
-  ipset create "${IPSET_NAME}" hash:net family inet -exist
-}
+ensure_ipset() { ipset create "\${IPSET_NAME}" hash:net family inet -exist; }
 
 load_ipv4_list() {
-  if [[ -s "${IPV4_CACHE_FILE}" ]]; then
-    cat "${IPV4_CACHE_FILE}"
+  if [[ -s "\${IPV4_CACHE_FILE}" ]]; then
+    cat "\${IPV4_CACHE_FILE}"
   else
-    echo "${STATIC_GOOGLE_IPV4_CIDRS}"
+    echo "\${STATIC_GOOGLE_IPV4_CIDRS}"
   fi
 }
 
 ipset_apply() {
   ensure_ipset
-  ipset flush "${IPSET_NAME}" || true
+  ipset flush "\${IPSET_NAME}" || true
   while IFS= read -r cidr; do
-    [[ -z "${cidr}" ]] && continue
-    ipset add "${IPSET_NAME}" "${cidr}" -exist
+    [[ -z "\${cidr}" ]] && continue
+    ipset add "\${IPSET_NAME}" "\${cidr}" -exist
   done < <(load_ipv4_list)
 }
 
 iptables_apply() {
-  # NAT：TCP 重定向到 redsocks
-  iptables -t nat -N "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -F "${NAT_CHAIN}"
-  iptables -t nat -A "${NAT_CHAIN}" -p tcp -m set --match-set "${IPSET_NAME}" dst -j REDIRECT --to-ports "${REDSOCKS_PORT}"
-  iptables -t nat -C OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || iptables -t nat -I OUTPUT 1 -j "${NAT_CHAIN}"
+  # drop old chains (per-CIDR old version compatibility)
+  iptables -t nat -D OUTPUT -j "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t filter -D OUTPUT -j "\${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "\${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -X "\${QUIC_CHAIN}" 2>/dev/null || true
 
-  # FILTER：阻断 QUIC（UDP/443）
-  iptables -t filter -N "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -F "${QUIC_CHAIN}"
-  iptables -t filter -A "${QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "${IPSET_NAME}" dst -j REJECT
-  iptables -t filter -C OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || iptables -t filter -I OUTPUT 1 -j "${QUIC_CHAIN}"
-}
+  # NAT (single ipset rule)
+  iptables -t nat -N "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "\${NAT_CHAIN}"
+  iptables -t nat -A "\${NAT_CHAIN}" -p tcp -m set --match-set "\${IPSET_NAME}" dst -j REDIRECT --to-ports "\${REDSOCKS_PORT}"
+  iptables -t nat -I OUTPUT 1 -j "\${NAT_CHAIN}"
 
-start() {
-  info "启动透明代理..."
-  warp_connect
-  start_redsocks
-  ipset_apply
-  iptables_apply
-  info "完成"
-}
-
-stop() {
-  info "停止透明代理..."
-  pkill redsocks 2>/dev/null || true
-
-  iptables -t nat -D OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
-
-  iptables -t filter -D OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
-
-  info "完成"
-}
-
-status() {
-  echo "=== WARP 状态 ==="
-  warp-cli status 2>/dev/null || echo "WARP 未运行"
-  echo ""
-  echo "=== Redsocks ==="
-  pgrep -x redsocks >/dev/null && echo "运行中" || echo "未运行"
-  echo ""
-  echo "=== ipset（${IPSET_NAME}）==="
-  ipset list "${IPSET_NAME}" 2>/dev/null | awk 'NR==1 || NR==2 || $1=="Number" || $1=="Members:" {print}' || echo "未创建"
-  echo ""
-  echo "=== NAT 规则（命中计数）==="
-  iptables -t nat -L "${NAT_CHAIN}" -n -v 2>/dev/null | head -10 || echo "无规则"
-  echo ""
-  echo "=== QUIC 阻断（命中计数）==="
-  iptables -t filter -L "${QUIC_CHAIN}" -n -v 2>/dev/null | head -10 || echo "无规则"
+  # QUIC block (udp/443 only for google ipset)
+  iptables -t filter -N "\${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "\${QUIC_CHAIN}"
+  iptables -t filter -A "\${QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "\${IPSET_NAME}" dst -j REJECT
+  iptables -t filter -I OUTPUT 1 -j "\${QUIC_CHAIN}"
 }
 
 update() {
   info "更新 Google IPv4 段（goog.json）..."
-  mkdir -p "${CACHE_DIR}"
-
-  local tmp
-  tmp="$(mktemp)"
-  curl -fsSL "${GOOG_JSON_URL}" -o "${tmp}"
-
+  mkdir -p "\${CACHE_DIR}"
+  tmp="\$(mktemp)"
+  curl -fsSL "\${GOOG_JSON_URL}" -o "\${tmp}"
   if command -v python3 >/dev/null 2>&1; then
-    python3 - <<PY > "${IPV4_CACHE_FILE}"
+    python3 - <<PY > "\${IPV4_CACHE_FILE}"
 import json
-with open("${tmp}","r",encoding="utf-8") as f:
-    data=json.load(f)
-out=[]
-for p in data.get("prefixes",[]):
-    v=p.get("ipv4Prefix")
-    if v: out.append(v)
-print("\n".join(sorted(set(out))))
+data=json.load(open("${tmp}","r",encoding="utf-8"))
+out=sorted({p["ipv4Prefix"] for p in data.get("prefixes",[]) if "ipv4Prefix" in p})
+print("\\n".join(out))
 PY
   else
-    grep -oE '"ipv4Prefix"\s*:\s*"[^"]+"' "${tmp}" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u > "${IPV4_CACHE_FILE}"
+    grep -oE '"ipv4Prefix"\\s*:\\s*"[^"]+"' "\${tmp}" | sed -E 's/.*"([^"]+)".*/\\1/' | sort -u > "\${IPV4_CACHE_FILE}"
   fi
-
-  rm -f "${tmp}"
-
-  [[ -s "${IPV4_CACHE_FILE}" ]] || { echo "更新失败：未解析到 IPv4 段" >&2; return 1; }
-
-  info "已更新缓存：${IPV4_CACHE_FILE}（$(wc -l < "${IPV4_CACHE_FILE}") 条）"
-  info "重启透明代理..."
-  stop || true
-  start
+  rm -f "\${tmp}"
+  [[ -s "\${IPV4_CACHE_FILE}" ]] || { echo "update failed" >&2; exit 1; }
+  info "已更新：\${IPV4_CACHE_FILE}（\$(wc -l < "\${IPV4_CACHE_FILE}") 条）"
 }
 
-case "${1:-}" in
+start() { warp_connect; start_redsocks; ipset_apply; iptables_apply; info "完成"; }
+stop() {
+  pkill redsocks 2>/dev/null || true
+  iptables -t nat -D OUTPUT -j "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "\${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t filter -D OUTPUT -j "\${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "\${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -X "\${QUIC_CHAIN}" 2>/dev/null || true
+  info "完成"
+}
+status() {
+  echo "=== ipset ==="
+  ipset list "\${IPSET_NAME}" 2>/dev/null | head -n 30 || echo "ipset missing"
+  echo
+  echo "=== NAT ==="
+  iptables -t nat -S "\${NAT_CHAIN}" 2>/dev/null || true
+  echo
+  echo "=== QUIC ==="
+  iptables -t filter -S "\${QUIC_CHAIN}" 2>/dev/null || true
+}
+
+case "\${1:-}" in
+  update) update ;;
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 0.3; start ;;
+  restart) stop; sleep 0.2; start ;;
   status) status ;;
-  update) update ;;
-  *)
-    echo "用法: warp-google {start|stop|restart|status|update}"
-    ;;
+  *) echo "用法: warp-google {update|start|stop|restart|status}" ;;
 esac
-SCRIPT
+EOF
 
   chmod +x /usr/local/bin/warp-google
   success "warp-google 已创建"
 }
 
-write_systemd_service() {
-  info "创建/更新 warp-google.service..."
-  cat > /etc/systemd/system/warp-google.service <<EOF
-[Unit]
-Description=WARP Google Transparent Proxy (ipset)
-After=network-online.target warp-svc.service
-Wants=network-online.target warp-svc.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/warp-google start
-ExecStop=/usr/local/bin/warp-google stop
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now warp-google >/dev/null 2>&1 || true
-  success "warp-google 服务已启用"
-}
-
 #========================
-# 生成 /usr/local/bin/warp（含 upgrade）
+# /usr/local/bin/warp (with upgrade)
 #========================
 write_warp_cli() {
-  info "创建 /usr/local/bin/warp（管理命令）..."
-  cat > /usr/local/bin/warp <<'WARPSCRIPT'
+  info "创建 /usr/local/bin/warp（管理命令 + upgrade）..."
+  cat > /usr/local/bin/warp <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh}"
-GAI_MARK="# warp-script: prefer ipv4"
-
-# shellcheck disable=SC1091
-. /etc/os-release 2>/dev/null || true
-OS_ID="${ID:-unknown}"
-
-do_status() {
-  warp-cli status 2>/dev/null || echo "WARP 未运行/未安装"
-  echo ""
-  /usr/local/bin/warp-google status 2>/dev/null || echo "warp-google 未安装"
-}
-
-do_start() {
-  warp-cli connect 2>/dev/null || true
-  /usr/local/bin/warp-google start
-}
-
-do_stop() {
-  /usr/local/bin/warp-google stop 2>/dev/null || true
-  warp-cli disconnect 2>/dev/null || true
-}
-
-do_restart() {
-  do_stop
-  sleep 1
-  do_start
-}
-
-do_test() {
-  echo "测试 Google："
-  curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\n" https://www.google.com || true
-  echo ""
-  echo "WARP Trace（走 socks5h）："
-  curl -s --max-time 10 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" https://www.cloudflare.com/cdn-cgi/trace | grep -E "^warp=" || echo "warp=未检测到"
-}
-
-do_ip() {
-  echo "直连 IP:"
-  curl -4 -s --max-time 8 ip.sb || true
-  echo ""
-  echo "WARP IP（走 socks5h）："
-  curl -s --max-time 8 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" ip.sb || true
-  echo ""
-}
-
-do_update() {
-  /usr/local/bin/warp-google update
-}
-
-do_upgrade() {
-  echo "[warp] 正在自升级：下载最新脚本并覆盖升级..."
-  local tmp
-  tmp="$(mktemp)"
-  curl -fsSL "${REPO_RAW_URL}" -o "${tmp}"
-  chmod +x "${tmp}"
-  bash "${tmp}" --install
-  rm -f "${tmp}"
-  echo "[warp] 升级完成。"
-}
-
-do_uninstall() {
-  read -r -p "确定要卸载 WARP？[y/N]: " confirm
-  [[ "${confirm}" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
-
-  /usr/local/bin/warp-google stop 2>/dev/null || true
-  warp-cli disconnect 2>/dev/null || true
-
-  systemctl disable --now warp-google 2>/dev/null || true
-  systemctl disable --now warp-svc 2>/dev/null || true
-
-  rm -f /etc/systemd/system/warp-google.service
-  rm -f /usr/local/bin/warp-google
-  rm -f /etc/redsocks.conf
-  rm -rf /etc/warp-google
-
-  systemctl daemon-reload 2>/dev/null || true
-
-  iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null || true
-  iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
-  iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
-
-  iptables -t filter -D OUTPUT -j WARP_GOOGLE_QUIC 2>/dev/null || true
-  iptables -t filter -F WARP_GOOGLE_QUIC 2>/dev/null || true
-  iptables -t filter -X WARP_GOOGLE_QUIC 2>/dev/null || true
-
-  ipset destroy warp_google4 2>/dev/null || true
-  sed -i "/$GAI_MARK/,+1d" /etc/gai.conf 2>/dev/null || true
-
-  case "${OS_ID}" in
-    ubuntu|debian)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get remove -y cloudflare-warp redsocks 2>/dev/null || true
-      rm -f /etc/apt/sources.list.d/cloudflare-client.list
-      rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-      ;;
-    centos|rhel|rocky|almalinux|fedora)
-      (command -v dnf >/dev/null 2>&1 && dnf remove -y cloudflare-warp redsocks) 2>/dev/null || \
-      yum remove -y cloudflare-warp redsocks 2>/dev/null || true
-      rm -f /etc/yum.repos.d/cloudflare-warp.repo
-      ;;
-  esac
-
-  rm -f /usr/local/bin/warp
-  echo "WARP 已卸载"
-}
 
 case "${1:-}" in
-  status) do_status ;;
-  start) do_start ;;
-  stop) do_stop ;;
-  restart) do_restart ;;
-  test) do_test ;;
-  ip) do_ip ;;
-  update) do_update ;;
-  upgrade) do_upgrade ;;
-  uninstall) do_uninstall ;;
+  status)
+    warp-cli status 2>/dev/null || true
+    echo
+    /usr/local/bin/warp-google status
+    ;;
+  start)
+    warp-cli connect 2>/dev/null || true
+    /usr/local/bin/warp-google start
+    ;;
+  stop)
+    /usr/local/bin/warp-google stop || true
+    warp-cli disconnect 2>/dev/null || true
+    ;;
+  restart)
+    /usr/local/bin/warp-google restart
+    ;;
+  test)
+    echo "Google:"
+    curl -s --max-time 10 -o /dev/null -w "code=%{http_code}\n" https://www.google.com || true
+    echo "Trace (socks5h):"
+    curl -s --max-time 10 -x "socks5h://127.0.0.1:40000" https://www.cloudflare.com/cdn-cgi/trace | grep -E "^warp=" || true
+    ;;
+  ip)
+    echo "direct:"; curl -4 -s --max-time 8 ip.sb || true
+    echo; echo "warp:"; curl -s --max-time 8 -x "socks5h://127.0.0.1:40000" ip.sb || true
+    ;;
+  update)
+    /usr/local/bin/warp-google update
+    /usr/local/bin/warp-google restart
+    ;;
+  upgrade)
+    echo "[warp] upgrade: download -> syntax check -> install"
+    tmp="$(mktemp)"
+    if ! curl -fsSL "${REPO_RAW_URL}" -o "${tmp}"; then
+      echo "[warp] download failed: ${REPO_RAW_URL}" >&2
+      rm -f "${tmp}"
+      exit 1
+    fi
+    chmod +x "${tmp}"
+    if ! bash -n "${tmp}"; then
+      echo "[warp] syntax check failed, keep file: ${tmp}" >&2
+      exit 1
+    fi
+    bash "${tmp}" --install || bash "${tmp}"
+    rm -f "${tmp}"
+    echo "[warp] done"
+    ;;
+  uninstall)
+    echo "请运行安装脚本的卸载入口（或手动清理）。"
+    ;;
   *)
-    echo "用法: warp <命令>"
-    echo "  status | start | stop | restart | test | ip | update | upgrade | uninstall"
+    echo "用法: warp {status|start|stop|restart|test|ip|update|upgrade}"
     ;;
 esac
-WARPSCRIPT
-
+EOF
   chmod +x /usr/local/bin/warp
   success "warp 管理命令已创建"
 }
 
 #========================
-# 安装/卸载/状态
+# Install flow
 #========================
 do_install() {
+  show_banner
   info "开始安装/覆盖升级 v${SCRIPT_VERSION} ..."
-  log "========== install/upgrade v${SCRIPT_VERSION} =========="
+  log "install/upgrade v${SCRIPT_VERSION}"
 
   install_prereqs
   warn_firewall_backend
-
   install_warp_client
-  install_redsocks
 
   setup_gai_conf
   write_redsocks_conf
 
   write_warp_google
-  write_systemd_service
   write_warp_cli
 
   configure_warp
 
-  if /usr/local/bin/warp-google update >/dev/null 2>&1; then
-    success "Google IP 段已更新到最新（goog.json）"
-  else
-    warn "Google IP 段更新失败（将使用静态兜底段）。你可稍后执行：warp update"
-    systemctl restart warp-google >/dev/null 2>&1 || true
-  fi
+  # Update ranges + start
+  /usr/local/bin/warp-google update || warn "Google ranges 更新失败，将使用静态兜底"
+  /usr/local/bin/warp-google restart || /usr/local/bin/warp-google start || true
 
   success "安装/升级完成！"
-  echo -e "管理命令：${GREEN}warp status | warp test | warp update | warp upgrade${NC}"
+  echo -e "使用：${GREEN}warp status | warp test | warp update | warp upgrade${NC}"
 }
 
 do_uninstall() {
-  if command -v warp >/dev/null 2>&1; then
-    warp uninstall
-  else
-    warn "未检测到 warp 管理命令，跳过。"
-  fi
+  show_banner
+  warn "卸载入口建议仍用旧版 warp uninstall 的完整逻辑（可后续补齐）。"
+  warn "当前脚本仅提供安装/升级与升级命令。"
 }
 
 do_status() {
@@ -692,43 +502,30 @@ do_status() {
 
 show_menu() {
   echo -e "${YELLOW}请选择操作:${NC}\n"
-  echo -e "  ${GREEN}1.${NC} 安装/升级 WARP（ipset版）"
-  echo -e "  ${GREEN}2.${NC} 卸载"
+  echo -e "  ${GREEN}1.${NC} 安装/升级（ipset版）"
   echo -e "  ${GREEN}3.${NC} 查看状态"
   echo -e "  ${GREEN}0.${NC} 退出\n"
-  read -r -p "请输入选项 [0-3]: " choice
+  read -r -p "请输入选项 [0/1/3]: " choice
   case "${choice}" in
     1) do_install ;;
-    2) do_uninstall ;;
     3) do_status ;;
-    0) echo -e "\n${GREEN}再见！${NC}\n"; exit 0 ;;
+    0) echo "bye"; exit 0 ;;
     *) error "无效选项" ;;
   esac
 }
 
 #========================
-# ✅ 关键：main() 绝对可靠
+# Main (single & robust)
 #========================
 main() {
   check_root
   detect_system
 
   case "${1:-}" in
-    --install|install)
-      show_banner
-      do_install
-      ;;
-    --uninstall|uninstall)
-      show_banner
-      do_uninstall
-      ;;
-    --status|status)
-      do_status
-      ;;
-    *)
-      show_banner
-      show_menu
-      ;;
+    --install|install) do_install ;;
+    --status|status) do_status ;;
+    --uninstall|uninstall) do_uninstall ;;
+    *) show_banner; show_menu ;;
   esac
 }
 
