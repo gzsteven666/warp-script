@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Google unlock via Cloudflare WARP (ipset)
 # Author: gzsteven666
-# Version: 1.3.4
+# Version: 1.3.5
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -25,7 +25,6 @@ CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 
-# 扩展的静态 IP 列表，包含 Google Fonts、APIs 等所有服务
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
@@ -73,6 +72,7 @@ STATIC_GOOGLE_IPV4_CIDRS="
 199.36.156.0/24
 199.192.112.0/22
 199.223.232.0/21
+203.208.0.0/14
 207.223.160.0/20
 208.65.152.0/22
 208.68.108.0/22
@@ -150,13 +150,29 @@ detect_system() {
   success "系统: ${OS} ${VERSION} (${CODENAME})"
 }
 
+setup_cloudflare_dns() {
+  info "配置 Cloudflare DNS（解决 WARP 区域路由问题）..."
+  
+  if [[ -f /etc/resolv.conf ]] && ! [[ -L /etc/resolv.conf ]]; then
+    cp /etc/resolv.conf /etc/resolv.conf.warp-backup 2>/dev/null || true
+  fi
+  
+  cat > /etc/resolv.conf << 'EOF'
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+options timeout:2 attempts:3 rotate
+EOF
+  
+  success "DNS 已配置为 Cloudflare"
+}
+
 install_prereqs() {
   info "安装依赖..."
   case "${OS}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 redsocks >/dev/null 2>&1 || {
+      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 redsocks dnsutils >/dev/null 2>&1 || {
         error "依赖安装失败"
         return 1
       }
@@ -164,10 +180,10 @@ install_prereqs() {
     centos|rhel|rocky|almalinux|fedora)
       if command -v dnf >/dev/null 2>&1; then
         dnf install -y epel-release >/dev/null 2>&1 || true
-        dnf install -y curl ca-certificates iptables ipset python3 redsocks >/dev/null 2>&1 || true
+        dnf install -y curl ca-certificates iptables ipset python3 redsocks bind-utils >/dev/null 2>&1 || true
       else
         yum install -y epel-release >/dev/null 2>&1 || true
-        yum install -y curl ca-certificates iptables ipset python3 redsocks >/dev/null 2>&1 || true
+        yum install -y curl ca-certificates iptables ipset python3 redsocks bind-utils >/dev/null 2>&1 || true
       fi
       ;;
     *)
@@ -345,6 +361,7 @@ STATIC_GOOGLE_IPV4_CIDRS="
 199.36.156.0/24
 199.192.112.0/22
 199.223.232.0/21
+203.208.0.0/14
 207.223.160.0/20
 208.65.152.0/22
 208.68.108.0/22
@@ -583,6 +600,11 @@ case "\${1:-}" in
     
     sed -i "/\${GAI_MARK}/,+1d" /etc/gai.conf 2>/dev/null || true
     
+    if [[ -f /etc/resolv.conf.warp-backup ]]; then
+      mv /etc/resolv.conf.warp-backup /etc/resolv.conf 2>/dev/null || true
+      echo "已恢复原 DNS 配置"
+    fi
+    
     if [[ -f /etc/os-release ]]; then
       source /etc/os-release
       case "\${ID:-}" in
@@ -653,6 +675,7 @@ do_install() {
   log "install v${SCRIPT_VERSION}"
 
   install_prereqs
+  setup_cloudflare_dns
   install_warp_client
 
   setup_gai_conf
