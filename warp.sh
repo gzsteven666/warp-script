@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Google unlock via Cloudflare WARP (ipset)
 # Author: gzsteven666
+# Version: 1.3.4
 #
-# Usage:
-#   Interactive:
-#     bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
-#   Non-interactive install/upgrade:
-#     bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh) --install
+# 使用方法:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-#========================
-# Config
-#========================
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -30,33 +25,65 @@ CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 
+# 扩展的静态 IP 列表，包含 Google Fonts、APIs 等所有服务
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
+8.34.208.0/20
+8.35.192.0/20
+23.236.48.0/20
+23.251.128.0/19
 34.0.0.0/9
 35.184.0.0/13
 35.192.0.0/12
 35.224.0.0/12
 35.240.0.0/13
+64.18.0.0/20
 64.233.160.0/19
 66.102.0.0/20
 66.249.64.0/19
+70.32.128.0/19
 72.14.192.0/18
+74.114.24.0/21
 74.125.0.0/16
 104.132.0.0/14
+104.154.0.0/15
+104.196.0.0/14
+104.237.160.0/19
+107.167.160.0/19
+107.178.192.0/18
+108.59.80.0/20
+108.170.192.0/18
 108.177.0.0/17
+130.211.0.0/16
+136.112.0.0/12
 142.250.0.0/15
+146.148.0.0/17
+162.216.148.0/22
+162.222.176.0/21
+172.110.32.0/21
 172.217.0.0/16
 172.253.0.0/16
 173.194.0.0/16
+173.255.112.0/20
+192.158.28.0/22
+192.178.0.0/15
+193.186.4.0/24
+199.36.154.0/23
+199.36.156.0/24
+199.192.112.0/22
+199.223.232.0/21
+207.223.160.0/20
+208.65.152.0/22
+208.68.108.0/22
+208.81.188.0/22
+208.117.224.0/19
 209.85.128.0/17
 216.58.192.0/19
+216.73.80.0/20
 216.239.32.0/19
 "
 
-#========================
-# Colors
-#========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -69,9 +96,8 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 
-# 修复：加 || true 防止 set -e 导致退出
 check_root() {
-  [[ ${EUID:-0} -ne 0 ]] && { error "请使用 root 运行！"; exit 1; } || true
+  [[ ${EUID:-0} -ne 0 ]] && { error "请使用 root 运行"; exit 1; } || true
 }
 
 show_banner() {
@@ -84,22 +110,18 @@ show_banner() {
   echo -e "${NC}"
 }
 
-#========================
-# OS detect
-#========================
 OS=""
 VERSION=""
 CODENAME=""
 
 detect_system() {
   if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
     source /etc/os-release
     OS="${ID:-}"
     VERSION="${VERSION_ID:-}"
     CODENAME="${VERSION_CODENAME:-}"
   else
-    error "无法检测系统（缺少 /etc/os-release）"
+    error "无法检测系统"
     exit 1
   fi
 
@@ -128,18 +150,6 @@ detect_system() {
   success "系统: ${OS} ${VERSION} (${CODENAME})"
 }
 
-warn_firewall_backend() {
-  if systemctl is-active firewalld >/dev/null 2>&1; then
-    warn "检测到 firewalld 正在运行，可能会冲掉 iptables 规则。"
-  fi
-  if iptables -V 2>/dev/null | grep -qi "nf_tables"; then
-    warn "检测到 iptables 使用 nf_tables backend（兼容层）。"
-  fi
-}
-
-#========================
-# Install deps
-#========================
 install_prereqs() {
   info "安装依赖..."
   case "${OS}" in
@@ -184,7 +194,7 @@ install_warp_client() {
       install -m 0755 -d /usr/share/keyrings
       curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
-      [[ -z "${CODENAME}" ]] && { error "无法获取系统代号 CODENAME"; return 1; } || true
+      [[ -z "${CODENAME}" ]] && { error "无法获取 CODENAME"; return 1; } || true
 
       echo "deb [arch=${arch} signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" \
         > /etc/apt/sources.list.d/cloudflare-client.list
@@ -217,7 +227,7 @@ EOF
       ;;
   esac
 
-  command -v warp-cli >/dev/null 2>&1 || { error "WARP 安装失败：未找到 warp-cli"; return 1; }
+  command -v warp-cli >/dev/null 2>&1 || { error "未找到 warp-cli"; return 1; }
 
   info "启动 warp-svc..."
   systemctl enable --now warp-svc >/dev/null 2>&1 || true
@@ -244,12 +254,12 @@ setup_gai_conf() {
       echo "${GAI_MARK}"
       echo "precedence ::ffff:0:0/96  100"
     } >> /etc/gai.conf
-    success "已写入 /etc/gai.conf"
+    success "已配置 IPv4 优先"
   fi
 }
 
 write_redsocks_conf() {
-  info "写入 redsocks 配置..."
+  info "配置 redsocks..."
   cat > /etc/redsocks.conf <<EOF
 base {
   log_debug = off;
@@ -269,9 +279,6 @@ EOF
   success "redsocks 配置完成"
 }
 
-#========================
-# /usr/local/bin/warp-google (ipset)
-#========================
 write_warp_google() {
   info "创建 /usr/local/bin/warp-google..."
   mkdir -p "${CACHE_DIR}"
@@ -294,24 +301,58 @@ IPV4_CACHE_FILE="${IPV4_CACHE_FILE:-/etc/warp-google/google_ipv4.txt}"
 STATIC_GOOGLE_IPV4_CIDRS="
 8.8.4.0/24
 8.8.8.0/24
+8.34.208.0/20
+8.35.192.0/20
+23.236.48.0/20
+23.251.128.0/19
 34.0.0.0/9
 35.184.0.0/13
 35.192.0.0/12
 35.224.0.0/12
 35.240.0.0/13
+64.18.0.0/20
 64.233.160.0/19
 66.102.0.0/20
 66.249.64.0/19
+70.32.128.0/19
 72.14.192.0/18
+74.114.24.0/21
 74.125.0.0/16
 104.132.0.0/14
+104.154.0.0/15
+104.196.0.0/14
+104.237.160.0/19
+107.167.160.0/19
+107.178.192.0/18
+108.59.80.0/20
+108.170.192.0/18
 108.177.0.0/17
+130.211.0.0/16
+136.112.0.0/12
 142.250.0.0/15
+146.148.0.0/17
+162.216.148.0/22
+162.222.176.0/21
+172.110.32.0/21
 172.217.0.0/16
 172.253.0.0/16
 173.194.0.0/16
+173.255.112.0/20
+192.158.28.0/22
+192.178.0.0/15
+193.186.4.0/24
+199.36.154.0/23
+199.36.156.0/24
+199.192.112.0/22
+199.223.232.0/21
+207.223.160.0/20
+208.65.152.0/22
+208.68.108.0/22
+208.81.188.0/22
+208.117.224.0/19
 209.85.128.0/17
 216.58.192.0/19
+216.73.80.0/20
 216.239.32.0/19
 "
 
@@ -345,7 +386,6 @@ ipset_apply() {
 }
 
 iptables_apply() {
-  # 清理旧规则
   iptables -t nat -D OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
@@ -353,13 +393,11 @@ iptables_apply() {
   iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
 
-  # NAT (单条 ipset 规则)
   iptables -t nat -N "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -F "${NAT_CHAIN}"
   iptables -t nat -A "${NAT_CHAIN}" -p tcp -m set --match-set "${IPSET_NAME}" dst -j REDIRECT --to-ports "${REDSOCKS_PORT}"
   iptables -t nat -I OUTPUT 1 -j "${NAT_CHAIN}"
 
-  # QUIC 阻断
   iptables -t filter -N "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -F "${QUIC_CHAIN}"
   iptables -t filter -A "${QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "${IPSET_NAME}" dst -j REJECT
@@ -367,7 +405,7 @@ iptables_apply() {
 }
 
 update() {
-  info "更新 Google IPv4 段..."
+  info "更新 Google IP 段..."
   mkdir -p "${CACHE_DIR}"
   local tmp
   tmp="$(mktemp)"
@@ -386,7 +424,6 @@ with open('${tmp}', 'r') as f:
 prefixes = sorted({p['ipv4Prefix'] for p in data.get('prefixes', []) if 'ipv4Prefix' in p})
 print('\n'.join(prefixes))
 " > "${IPV4_CACHE_FILE}" 2>/dev/null || {
-      info "Python 解析失败，使用 grep"
       grep -oE '"ipv4Prefix"\s*:\s*"[^"]+"' "${tmp}" | sed -E 's/.*"([^"]+)".*/\1/' | sort -u > "${IPV4_CACHE_FILE}"
     }
   else
@@ -396,7 +433,7 @@ print('\n'.join(prefixes))
   rm -f "${tmp}"
   
   if [[ -s "${IPV4_CACHE_FILE}" ]]; then
-    info "已更新：${IPV4_CACHE_FILE}（$(wc -l < "${IPV4_CACHE_FILE}") 条）"
+    info "已更新：$(wc -l < "${IPV4_CACHE_FILE}") 条 IP 段"
   else
     info "更新失败，将使用静态列表"
     return 1
@@ -426,7 +463,7 @@ stop() {
 
 status() {
   echo "=== ipset ==="
-  ipset list "${IPSET_NAME}" 2>/dev/null | head -n 20 || echo "ipset 不存在"
+  ipset list "${IPSET_NAME}" 2>/dev/null | head -n 15 || echo "不存在"
   echo
   echo "=== NAT 规则 ==="
   iptables -t nat -S "${NAT_CHAIN}" 2>/dev/null || echo "无"
@@ -452,9 +489,6 @@ WARPGOOGLEEOF
   success "warp-google 已创建"
 }
 
-#========================
-# /usr/local/bin/warp
-#========================
 write_warp_cli() {
   info "创建 /usr/local/bin/warp..."
   
@@ -465,6 +499,7 @@ set -euo pipefail
 WARP_PROXY_PORT="${WARP_PROXY_PORT}"
 REPO_RAW_URL="${REPO_RAW_URL}"
 GAI_MARK="${GAI_MARK}"
+SCRIPT_VERSION="${SCRIPT_VERSION}"
 
 case "\${1:-}" in
   status)
@@ -537,7 +572,6 @@ case "\${1:-}" in
     rm -rf /etc/warp-google
     systemctl daemon-reload 2>/dev/null || true
     
-    # 清理 iptables
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null || true
     iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
     iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
@@ -545,13 +579,10 @@ case "\${1:-}" in
     iptables -t filter -F WARP_GOOGLE_QUIC 2>/dev/null || true
     iptables -t filter -X WARP_GOOGLE_QUIC 2>/dev/null || true
     
-    # 清理 ipset
     ipset destroy warp_google4 2>/dev/null || true
     
-    # 恢复 gai.conf
     sed -i "/\${GAI_MARK}/,+1d" /etc/gai.conf 2>/dev/null || true
     
-    # 卸载软件包
     if [[ -f /etc/os-release ]]; then
       source /etc/os-release
       case "\${ID:-}" in
@@ -571,7 +602,7 @@ case "\${1:-}" in
     echo "卸载完成"
     ;;
   *)
-    echo "WARP 管理工具 v${SCRIPT_VERSION:-1.3.3}"
+    echo "WARP 管理工具 v\${SCRIPT_VERSION}"
     echo
     echo "用法: warp <命令>"
     echo
@@ -593,9 +624,6 @@ EOF
   success "warp 管理命令已创建"
 }
 
-#========================
-# systemd service
-#========================
 write_systemd_service() {
   info "创建 systemd 服务..."
   cat > /etc/systemd/system/warp-google.service <<'EOF'
@@ -619,16 +647,12 @@ EOF
   success "systemd 服务已创建"
 }
 
-#========================
-# Install flow
-#========================
 do_install() {
   show_banner
   info "开始安装 v${SCRIPT_VERSION} ..."
   log "install v${SCRIPT_VERSION}"
 
   install_prereqs
-  warn_firewall_backend
   install_warp_client
 
   setup_gai_conf
@@ -640,42 +664,29 @@ do_install() {
 
   configure_warp
 
-  # 更新 IP 段并启动
   /usr/local/bin/warp-google update || warn "Google IP 更新失败，使用静态列表"
   /usr/local/bin/warp-google start || true
 
   echo
-  success "安装完成！"
+  success "安装完成"
   echo -e "\n管理命令: ${GREEN}warp {status|start|stop|restart|test|ip|update|upgrade|uninstall}${NC}\n"
   
-  # 测试
   echo -e "${CYAN}测试连接...${NC}"
   sleep 2
   local code
   code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com || echo "000")
   if [[ "${code}" == "200" ]]; then
-    success "Google 连接成功！"
+    success "Google 连接成功"
   else
     warn "Google 测试返回: ${code}"
   fi
-  
-  local warp_trace
-  warp_trace=$(curl -s --max-time 10 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" https://www.cloudflare.com/cdn-cgi/trace | grep -E "^warp=" || true)
-  if [[ -n "${warp_trace}" ]]; then
-    echo -e "WARP Trace: ${GREEN}${warp_trace}${NC}"
-  fi
-}
-
-do_uninstall() {
-  show_banner
-  /usr/local/bin/warp uninstall 2>/dev/null || warn "请手动运行: warp uninstall"
 }
 
 do_status() {
   if command -v warp >/dev/null 2>&1; then
     warp status
   else
-    echo "未安装。请运行: --install"
+    echo "未安装"
   fi
 }
 
@@ -689,16 +700,13 @@ show_menu() {
   read -r -p "请输入选项 [0-3]: " choice
   case "${choice}" in
     1) do_install ;;
-    2) do_uninstall ;;
+    2) /usr/local/bin/warp uninstall 2>/dev/null || warn "请先安装" ;;
     3) do_status ;;
-    0) echo "再见！"; exit 0 ;;
+    0) echo "再见"; exit 0 ;;
     *) error "无效选项" ;;
   esac
 }
 
-#========================
-# Main
-#========================
 main() {
   check_root
   detect_system
@@ -706,7 +714,6 @@ main() {
   case "${1:-}" in
     --install|install) do_install ;;
     --status|status) do_status ;;
-    --uninstall|uninstall) do_uninstall ;;
     *) show_banner; show_menu ;;
   esac
 }
