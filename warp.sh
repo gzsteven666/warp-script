@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Google unlock via Cloudflare WARP (ipset)
 # Author: gzsteven666
-# Version: 1.4.0
+# Version: 1.4.1
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -376,6 +376,10 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF_REDSOCKS_SERVICE
 
+  # 清理旧版本遗留的非 systemd 进程，避免端口冲突
+  pkill -x redsocks 2>/dev/null || true
+  sleep 0.5
+
   systemctl daemon-reload
   systemctl enable --now redsocks >/dev/null 2>&1 || true
   success "redsocks 服务已创建"
@@ -400,6 +404,8 @@ fi
 restart_redsocks() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl restart redsocks >/dev/null 2>&1 && return 0
+    logger -t "${LOG_TAG}" "systemctl restart redsocks failed"
+    return 1
   fi
   pkill -x redsocks 2>/dev/null || true
   sleep 1
@@ -416,8 +422,11 @@ fi
 
 if ! curl -s --max-time 10 -o /dev/null https://www.google.com; then
   logger -t "${LOG_TAG}" "Transparent proxy failed, restarting redsocks..."
-  restart_redsocks
-  logger -t "${LOG_TAG}" "redsocks restarted"
+  if restart_redsocks; then
+    logger -t "${LOG_TAG}" "redsocks restarted"
+  else
+    logger -t "${LOG_TAG}" "redsocks restart failed"
+  fi
 fi
 EOF_KEEPALIVE
 
