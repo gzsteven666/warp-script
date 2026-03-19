@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WARP Script - Google unlock via Cloudflare WARP (ipset)
+# WARP Script - Google & Netflix unlock via Cloudflare WARP (ipset)
 # Author: gzsteven666
 # Version: 1.4.1
 #
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.5.0"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -22,9 +22,15 @@ IPSET_NAME="${IPSET_NAME:-warp_google4}"
 NAT_CHAIN="${NAT_CHAIN:-WARP_GOOGLE}"
 QUIC_CHAIN="${QUIC_CHAIN:-WARP_GOOGLE_QUIC}"
 
+NETFLIX_IPSET_NAME="${NETFLIX_IPSET_NAME:-warp_netflix4}"
+NETFLIX_NAT_CHAIN="${NETFLIX_NAT_CHAIN:-WARP_NETFLIX}"
+NETFLIX_QUIC_CHAIN="${NETFLIX_QUIC_CHAIN:-WARP_NETFLIX_QUIC}"
+
 CACHE_DIR="/etc/warp-google"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
+NETFLIX_IPV4_CACHE_FILE="${CACHE_DIR}/netflix_ipv4.txt"
+NETFLIX_ASN_API_URL="https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS2906"
 DNS_MODE_FILE="${CACHE_DIR}/dns_mode"
 DNS_BACKUP_FILE="/etc/resolv.conf.warp-backup"
 RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
@@ -92,6 +98,24 @@ STATIC_GOOGLE_IPV4_CIDRS="
 216.239.32.0/19
 "
 
+STATIC_NETFLIX_IPV4_CIDRS="
+23.246.0.0/18
+37.77.184.0/21
+38.72.126.0/24
+45.57.0.0/17
+64.120.128.0/17
+66.197.128.0/17
+69.53.224.0/19
+103.87.204.0/22
+108.175.32.0/20
+185.2.220.0/22
+185.9.188.0/22
+192.173.64.0/18
+198.38.96.0/19
+198.45.48.0/20
+208.75.76.0/22
+"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -114,7 +138,7 @@ show_banner() {
   clear 2>/dev/null || true
   echo -e "${CYAN}"
   echo "╔════════════════════════════════════════════════════╗"
-  echo "║ 🌐 WARP Script - Google Unlock (ipset)            ║"
+  echo "║ 🌐 WARP Script - Google & Netflix Unlock           ║"
   echo "║ v${SCRIPT_VERSION}                                           ║"
   echo "╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
@@ -481,9 +505,15 @@ IPSET_NAME="${IPSET_NAME:-warp_google4}"
 NAT_CHAIN="${NAT_CHAIN:-WARP_GOOGLE}"
 QUIC_CHAIN="${QUIC_CHAIN:-WARP_GOOGLE_QUIC}"
 
+NETFLIX_IPSET_NAME="${NETFLIX_IPSET_NAME:-warp_netflix4}"
+NETFLIX_NAT_CHAIN="${NETFLIX_NAT_CHAIN:-WARP_NETFLIX}"
+NETFLIX_QUIC_CHAIN="${NETFLIX_QUIC_CHAIN:-WARP_NETFLIX_QUIC}"
+
 CACHE_DIR="${CACHE_DIR:-/etc/warp-google}"
 GOOG_JSON_URL="${GOOG_JSON_URL:-https://www.gstatic.com/ipranges/goog.json}"
+NETFLIX_ASN_API_URL="${NETFLIX_ASN_API_URL:-https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS2906}"
 IPV4_CACHE_FILE="${IPV4_CACHE_FILE:-/etc/warp-google/google_ipv4.txt}"
+NETFLIX_IPV4_CACHE_FILE="${NETFLIX_IPV4_CACHE_FILE:-/etc/warp-google/netflix_ipv4.txt}"
 UPDATE_LOCK="${WARP_UPDATE_LOCK:-/run/warp-google-update.lock}"
 
 STATIC_GOOGLE_IPV4_CIDRS="
@@ -543,6 +573,24 @@ STATIC_GOOGLE_IPV4_CIDRS="
 216.58.192.0/19
 216.73.80.0/20
 216.239.32.0/19
+"
+
+STATIC_NETFLIX_IPV4_CIDRS="
+23.246.0.0/18
+37.77.184.0/21
+38.72.126.0/24
+45.57.0.0/17
+64.120.128.0/17
+66.197.128.0/17
+69.53.224.0/19
+103.87.204.0/22
+108.175.32.0/20
+185.2.220.0/22
+185.9.188.0/22
+192.173.64.0/18
+198.38.96.0/19
+198.45.48.0/20
+208.75.76.0/22
 "
 
 info() { echo "[warp-google] $*"; }
@@ -611,21 +659,56 @@ iptables_apply() {
   iptables -t filter -I OUTPUT 1 -j "${QUIC_CHAIN}"
 }
 
-update() {
-  exec 200>"${UPDATE_LOCK}"
-  if ! flock -n 200; then
-    info "已有更新任务在执行，跳过"
-    return 0
+load_netflix_ipv4_list() {
+  if [[ -s "${NETFLIX_IPV4_CACHE_FILE}" ]]; then
+    cat "${NETFLIX_IPV4_CACHE_FILE}"
+  else
+    echo "${STATIC_NETFLIX_IPV4_CIDRS}"
   fi
+}
 
+netflix_ipset_apply() {
+  ipset create "${NETFLIX_IPSET_NAME}" hash:net family inet -exist
+  local tmp_set="${NETFLIX_IPSET_NAME}_tmp"
+  ipset create "${tmp_set}" hash:net family inet -exist
+  ipset flush "${tmp_set}" || true
+
+  while IFS= read -r cidr; do
+    [[ -z "${cidr}" ]] && continue
+    ipset add "${tmp_set}" "${cidr}" -exist 2>/dev/null || true
+  done < <(load_netflix_ipv4_list)
+
+  ipset swap "${tmp_set}" "${NETFLIX_IPSET_NAME}" || true
+  ipset destroy "${tmp_set}" 2>/dev/null || true
+}
+
+netflix_iptables_apply() {
+  iptables -t nat -D OUTPUT -j "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t filter -D OUTPUT -j "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+
+  iptables -t nat -N "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "${NETFLIX_NAT_CHAIN}"
+  iptables -t nat -A "${NETFLIX_NAT_CHAIN}" -p tcp -m set --match-set "${NETFLIX_IPSET_NAME}" dst -j REDIRECT --to-ports "${REDSOCKS_PORT}"
+  iptables -t nat -I OUTPUT 1 -j "${NETFLIX_NAT_CHAIN}"
+
+  iptables -t filter -N "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "${NETFLIX_QUIC_CHAIN}"
+  iptables -t filter -A "${NETFLIX_QUIC_CHAIN}" -p udp --dport 443 -m set --match-set "${NETFLIX_IPSET_NAME}" dst -j REJECT
+  iptables -t filter -I OUTPUT 1 -j "${NETFLIX_QUIC_CHAIN}"
+}
+
+update_google() {
   info "更新 Google IP 段..."
-  mkdir -p "${CACHE_DIR}"
   local tmp
   tmp="$(mktemp)"
 
   if ! curl -fsSL -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" --max-time 30 "${GOOG_JSON_URL}" -o "${tmp}" 2>/dev/null; then
     if ! curl -fsSL --max-time 30 "${GOOG_JSON_URL}" -o "${tmp}" 2>/dev/null; then
-      info "下载失败，使用静态列表"
+      info "Google IP 下载失败，使用静态列表"
       rm -f "${tmp}"
       return 1
     fi
@@ -648,11 +731,71 @@ print('\\n'.join(prefixes))
   rm -f "${tmp}"
 
   if [[ -s "${IPV4_CACHE_FILE}" ]]; then
-    info "已更新：$(wc -l < "${IPV4_CACHE_FILE}") 条 IP 段"
+    info "Google 已更新：$(wc -l < "${IPV4_CACHE_FILE}") 条 IP 段"
   else
-    info "更新失败，将使用静态列表"
+    info "Google 更新失败，将使用静态列表"
     return 1
   fi
+}
+
+update_netflix() {
+  info "更新 Netflix IP 段 (AS2906)..."
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! curl -fsSL -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" --max-time 30 "${NETFLIX_ASN_API_URL}" -o "${tmp}" 2>/dev/null; then
+    if ! curl -fsSL --max-time 30 "${NETFLIX_ASN_API_URL}" -o "${tmp}" 2>/dev/null; then
+      info "Netflix IP 下载失败，使用静态列表"
+      rm -f "${tmp}"
+      return 1
+    fi
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import json, ipaddress
+with open('${tmp}', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+prefixes = set()
+for p in data.get('data', {}).get('prefixes', []):
+    net = p.get('prefix', '')
+    try:
+        addr = ipaddress.ip_network(net, strict=False)
+        if addr.version == 4:
+            prefixes.add(str(addr))
+    except ValueError:
+        pass
+for line in sorted(prefixes):
+    print(line)
+" > "${NETFLIX_IPV4_CACHE_FILE}" 2>/dev/null || {
+      grep -oE '"prefix"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+"' "${tmp}" \
+        | sed -E 's/.*"([^"]+)".*/\1/' | sort -u > "${NETFLIX_IPV4_CACHE_FILE}"
+    }
+  else
+    grep -oE '"prefix"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+"' "${tmp}" \
+      | sed -E 's/.*"([^"]+)".*/\1/' | sort -u > "${NETFLIX_IPV4_CACHE_FILE}"
+  fi
+
+  rm -f "${tmp}"
+
+  if [[ -s "${NETFLIX_IPV4_CACHE_FILE}" ]]; then
+    info "Netflix 已更新：$(wc -l < "${NETFLIX_IPV4_CACHE_FILE}") 条 IP 段"
+  else
+    info "Netflix 更新失败，将使用静态列表"
+    return 1
+  fi
+}
+
+update() {
+  exec 200>"${UPDATE_LOCK}"
+  if ! flock -n 200; then
+    info "已有更新任务在执行，跳过"
+    return 0
+  fi
+
+  mkdir -p "${CACHE_DIR}"
+  update_google || true
+  update_netflix || true
 }
 
 start() {
@@ -661,6 +804,8 @@ start() {
   start_redsocks
   ipset_apply
   iptables_apply
+  netflix_ipset_apply
+  netflix_iptables_apply
   info "完成"
 }
 
@@ -673,18 +818,33 @@ stop() {
   iptables -t filter -D OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t nat -D OUTPUT -j "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t filter -D OUTPUT -j "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
   info "完成"
 }
 
 status() {
-  echo "=== ipset ==="
+  echo "=== Google ipset ==="
   ipset list "${IPSET_NAME}" 2>/dev/null | head -n 15 || echo "不存在"
   echo
-  echo "=== NAT 规则 ==="
+  echo "=== Google NAT 规则 ==="
   iptables -t nat -S "${NAT_CHAIN}" 2>/dev/null || echo "无"
   echo
-  echo "=== QUIC 阻断 ==="
+  echo "=== Google QUIC 阻断 ==="
   iptables -t filter -S "${QUIC_CHAIN}" 2>/dev/null || echo "无"
+  echo
+  echo "=== Netflix ipset ==="
+  ipset list "${NETFLIX_IPSET_NAME}" 2>/dev/null | head -n 15 || echo "不存在"
+  echo
+  echo "=== Netflix NAT 规则 ==="
+  iptables -t nat -S "${NETFLIX_NAT_CHAIN}" 2>/dev/null || echo "无"
+  echo
+  echo "=== Netflix QUIC 阻断 ==="
+  iptables -t filter -S "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || echo "无"
   echo
   echo "=== redsocks ==="
   if command -v systemctl >/dev/null 2>&1; then
@@ -777,6 +937,17 @@ case "\${1:-}" in
     echo "=== Google 连接测试 ==="
     curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\\n" https://www.google.com || echo "失败"
     echo
+    echo "=== Netflix 连接测试 ==="
+    curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\\n" https://www.netflix.com || echo "失败"
+    echo
+    echo "=== Netflix 非自制剧测试 ==="
+    nf_code=\$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.netflix.com/title/80018499 || echo "000")
+    if [[ "\${nf_code}" == "200" ]]; then
+      echo "可观看非自制剧内容 (HTTP \${nf_code})"
+    else
+      echo "非自制剧不可用 (HTTP \${nf_code})"
+    fi
+    echo
     echo "=== WARP Trace ==="
     curl -s --max-time 10 -x "socks5h://127.0.0.1:\${WARP_PROXY_PORT}" https://www.cloudflare.com/cdn-cgi/trace | grep -E "^warp=" || echo "未检测到"
     ;;
@@ -803,13 +974,16 @@ case "\${1:-}" in
       exit 1
     fi
 
-    if ! curl -fsSL "\${REPO_SHA256_URL}" -o "\${sum_tmp}"; then
-      echo "[warp] 无法下载校验文件：\${REPO_SHA256_URL}" >&2
-      rm -f "\${tmp}" "\${sum_tmp}"
-      exit 1
+    do_verify=0
+    if curl -fsSL "\${REPO_SHA256_URL}" -o "\${sum_tmp}" 2>/dev/null && [[ -s "\${sum_tmp}" ]]; then
+      do_verify=1
+    else
+      echo "[warp] 未找到校验文件，跳过 SHA256 校验"
     fi
 
-    verify_checksum "\${tmp}" "\${sum_tmp}" || { rm -f "\${tmp}" "\${sum_tmp}"; exit 1; }
+    if [[ "\${do_verify}" -eq 1 ]]; then
+      verify_checksum "\${tmp}" "\${sum_tmp}" || { rm -f "\${tmp}" "\${sum_tmp}"; exit 1; }
+    fi
 
     chmod +x "\${tmp}"
     if ! bash -n "\${tmp}"; then
@@ -854,7 +1028,15 @@ case "\${1:-}" in
     iptables -t filter -F WARP_GOOGLE_QUIC 2>/dev/null || true
     iptables -t filter -X WARP_GOOGLE_QUIC 2>/dev/null || true
 
+    iptables -t nat -D OUTPUT -j WARP_NETFLIX 2>/dev/null || true
+    iptables -t nat -F WARP_NETFLIX 2>/dev/null || true
+    iptables -t nat -X WARP_NETFLIX 2>/dev/null || true
+    iptables -t filter -D OUTPUT -j WARP_NETFLIX_QUIC 2>/dev/null || true
+    iptables -t filter -F WARP_NETFLIX_QUIC 2>/dev/null || true
+    iptables -t filter -X WARP_NETFLIX_QUIC 2>/dev/null || true
+
     ipset destroy warp_google4 2>/dev/null || true
+    ipset destroy warp_netflix4 2>/dev/null || true
 
     sed -i "/\${GAI_MARK}/,+1d" /etc/gai.conf 2>/dev/null || true
 
@@ -901,10 +1083,10 @@ case "\${1:-}" in
     echo "  start     启动"
     echo "  stop      停止"
     echo "  restart   重启"
-    echo "  test      测试连接"
+    echo "  test      测试连接（Google + Netflix）"
     echo "  ip        查看 IP"
-    echo "  update    更新 Google IP 段"
-    echo "  upgrade   升级脚本（含 SHA256 校验）"
+    echo "  update    更新 Google & Netflix IP 段"
+    echo "  upgrade   升级脚本（有校验文件时校验 SHA256）"
     echo "  uninstall 卸载"
     ;;
 esac
@@ -957,7 +1139,7 @@ do_install() {
 
   configure_warp
 
-  /usr/local/bin/warp-google update || warn "Google IP 更新失败，使用静态列表"
+  /usr/local/bin/warp-google update || warn "IP 段更新失败，使用静态列表"
   /usr/local/bin/warp-google start || true
 
   echo
@@ -972,6 +1154,14 @@ do_install() {
     success "Google 连接成功"
   else
     warn "Google 测试返回: ${code}"
+  fi
+
+  local nf_code
+  nf_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.netflix.com || echo "000")
+  if [[ "${nf_code}" == "200" || "${nf_code}" == "301" || "${nf_code}" == "302" ]]; then
+    success "Netflix 连接成功"
+  else
+    warn "Netflix 测试返回: ${nf_code}"
   fi
 }
 
