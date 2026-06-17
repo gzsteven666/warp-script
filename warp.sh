@@ -219,12 +219,16 @@ EOF_DNS
     cp /etc/resolv.conf "${DNS_BACKUP_FILE}" 2>/dev/null || true
   fi
 
-  if cat > /etc/resolv.conf <<'EOF_DNS_FILE'
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-options timeout:2 attempts:3 rotate
-EOF_DNS_FILE
-  then
+  local dns_write_rc
+  set +e
+  printf '%s\n' \
+    'nameserver 1.1.1.1' \
+    'nameserver 1.0.0.1' \
+    'options timeout:2 attempts:3 rotate' | tee /etc/resolv.conf >/dev/null
+  dns_write_rc=$?
+  set -e
+
+  if [[ "${dns_write_rc}" -eq 0 ]]; then
     echo "file" > "${DNS_MODE_FILE}"
     success "DNS 已配置为 Cloudflare"
   else
