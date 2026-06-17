@@ -190,6 +190,11 @@ detect_system() {
 }
 
 setup_cloudflare_dns() {
+  if [[ "${WARP_SKIP_DNS:-0}" == "1" ]]; then
+    warn "已跳过 DNS 配置 (WARP_SKIP_DNS=1)"
+    return 0
+  fi
+
   info "配置 Cloudflare DNS..."
   mkdir -p "${CACHE_DIR}"
 
