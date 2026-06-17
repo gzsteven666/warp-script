@@ -219,14 +219,19 @@ EOF_DNS
     cp /etc/resolv.conf "${DNS_BACKUP_FILE}" 2>/dev/null || true
   fi
 
-  cat > /etc/resolv.conf <<'EOF_DNS_FILE'
+  if cat > /etc/resolv.conf <<'EOF_DNS_FILE'
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 options timeout:2 attempts:3 rotate
 EOF_DNS_FILE
+  then
+    echo "file" > "${DNS_MODE_FILE}"
+    success "DNS 已配置为 Cloudflare"
+  else
+    warn "无法写入 /etc/resolv.conf，跳过 DNS 配置"
+    rm -f "${DNS_BACKUP_FILE}" 2>/dev/null || true
+  fi
 
-  echo "file" > "${DNS_MODE_FILE}"
-  success "DNS 已配置为 Cloudflare"
 }
 
 restore_dns() {
