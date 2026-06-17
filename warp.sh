@@ -130,6 +130,10 @@ log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null 
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+warp_cli() {
+  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+}
+
 check_root() {
   [[ ${EUID:-0} -ne 0 ]] && { error "请使用 root 运行"; exit 1; } || true
 }
@@ -336,15 +340,15 @@ EOF_REPO
 
 configure_warp() {
   info "配置 WARP..."
-  warp-cli --accept-tos registration new >/dev/null 2>&1 || warp-cli --accept-tos register >/dev/null 2>&1 || true
-  warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 || warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
-  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli mode proxy >/dev/null 2>&1 || true
-  warp-cli --accept-tos proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || warp-cli proxy port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || true
-  warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect >/dev/null 2>&1 || true
+  warp_cli registration new >/dev/null || warp_cli register >/dev/null || true
+  warp_cli tunnel protocol set MASQUE >/dev/null || true
+  warp_cli mode proxy >/dev/null || true
+  warp_cli proxy port "${WARP_PROXY_PORT}" >/dev/null || true
+  warp_cli connect >/dev/null || true
   sleep 2
 
   local status
-  status=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null || echo "未知")
+  status=$(warp_cli status || echo "未知")
   info "WARP 状态：${status}"
 }
 
@@ -436,17 +440,42 @@ restart_redsocks() {
   redsocks -c /etc/redsocks.conf >/dev/null 2>&1 &
 }
 
-if ! curl -s --max-time 10 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" -o /dev/null https://www.google.com; then
-  logger -t "${LOG_TAG}" "WARP proxy test failed, trying to reconnect..."
-  warp-cli disconnect 2>/dev/null || true
+warp_cli() {
+  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+}
+
+check_warp_proxy() {
+  curl -fsSL --max-time 12 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" \
+    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq '^warp=(on|plus)$'
+}
+
+check_transparent_url() {
+  local url="$1"
+  local code
+  code="$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")"
+  [[ "${code}" != "000" ]]
+}
+
+if ! check_warp_proxy; then
+  logger -t "${LOG_TAG}" "WARP proxy trace failed, trying to reconnect..."
+  warp_cli disconnect || true
   sleep 2
-  warp-cli connect 2>/dev/null || true
+  warp_cli connect || true
   sleep 3
 fi
 
-if ! curl -s --max-time 10 -o /dev/null https://www.google.com; then
-  logger -t "${LOG_TAG}" "Transparent proxy failed, restarting redsocks..."
-  if restart_redsocks; then
+if ! check_warp_proxy; then
+  logger -t "${LOG_TAG}" "WARP still unhealthy, restarting warp-svc..."
+  systemctl restart warp-svc >/dev/null 2>&1 || true
+  sleep 5
+  warp_cli connect || true
+fi
+
+if ! check_transparent_url "https://generativelanguage.googleapis.com" && ! check_transparent_url "https://gemini.google.com"; then
+  logger -t "${LOG_TAG}" "Gemini/Google transparent proxy failed, reapplying rules..."
+  if command -v /usr/local/bin/warp-google >/dev/null 2>&1; then
+    /usr/local/bin/warp-google restart >/dev/null 2>&1 && logger -t "${LOG_TAG}" "warp-google restarted" || true
+  elif restart_redsocks; then
     logger -t "${LOG_TAG}" "redsocks restarted"
   else
     logger -t "${LOG_TAG}" "redsocks restart failed"
@@ -488,6 +517,40 @@ EOF_KEEPALIVE_TIMER
   fi
 
   success "keepalive 已配置（systemd timer 每 10 分钟检测）"
+}
+
+write_update_timer() {
+  info "创建 IP 段自动更新 systemd timer..."
+
+  cat > /etc/systemd/system/warp-google-update.service <<'EOF_UPDATE_SERVICE'
+[Unit]
+Description=Update WARP Google and Netflix IP sets
+After=network-online.target warp-svc.service
+Wants=network-online.target warp-svc.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-google update
+ExecStart=/usr/local/bin/warp-google restart
+EOF_UPDATE_SERVICE
+
+  cat > /etc/systemd/system/warp-google-update.timer <<'EOF_UPDATE_TIMER'
+[Unit]
+Description=Update WARP Google and Netflix IP sets daily
+
+[Timer]
+OnBootSec=5min
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_UPDATE_TIMER
+
+  systemctl daemon-reload
+  systemctl enable --now warp-google-update.timer >/dev/null 2>&1 || true
+  success "IP 段自动更新已配置（每日执行，带随机延迟）"
 }
 
 write_warp_google() {
@@ -595,7 +658,20 @@ STATIC_NETFLIX_IPV4_CIDRS="
 
 info() { echo "[warp-google] $*"; }
 
-warp_connect() { warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true; }
+warp_cli() {
+  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+}
+
+warp_connect() { warp_cli connect || true; }
+
+delete_jump_all() {
+  local table="$1"
+  local chain="$2"
+  local target="$3"
+  while iptables -t "${table}" -D "${chain}" -j "${target}" 2>/dev/null; do
+    :
+  done
+}
 
 start_redsocks() {
   if command -v systemctl >/dev/null 2>&1; then
@@ -641,10 +717,10 @@ ipset_apply() {
 }
 
 iptables_apply() {
-  iptables -t nat -D OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || true
+  delete_jump_all nat OUTPUT "${NAT_CHAIN}"
   iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t filter -D OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || true
+  delete_jump_all filter OUTPUT "${QUIC_CHAIN}"
   iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
 
@@ -683,10 +759,10 @@ netflix_ipset_apply() {
 }
 
 netflix_iptables_apply() {
-  iptables -t nat -D OUTPUT -j "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  delete_jump_all nat OUTPUT "${NETFLIX_NAT_CHAIN}"
   iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
-  iptables -t filter -D OUTPUT -j "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  delete_jump_all filter OUTPUT "${NETFLIX_QUIC_CHAIN}"
   iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
 
@@ -811,19 +887,19 @@ start() {
 
 stop() {
   info "停止..."
-  stop_redsocks
-  iptables -t nat -D OUTPUT -j "${NAT_CHAIN}" 2>/dev/null || true
+  delete_jump_all nat OUTPUT "${NAT_CHAIN}"
   iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
-  iptables -t filter -D OUTPUT -j "${QUIC_CHAIN}" 2>/dev/null || true
+  delete_jump_all filter OUTPUT "${QUIC_CHAIN}"
   iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t nat -D OUTPUT -j "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  delete_jump_all nat OUTPUT "${NETFLIX_NAT_CHAIN}"
   iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
   iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
-  iptables -t filter -D OUTPUT -j "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  delete_jump_all filter OUTPUT "${NETFLIX_QUIC_CHAIN}"
   iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  stop_redsocks
   info "完成"
 }
 
@@ -915,33 +991,47 @@ verify_checksum() {
   echo "[warp] SHA256 校验通过"
 }
 
+warp_cli() {
+  warp-cli --accept-tos "\$@" 2>/dev/null || warp-cli "\$@" 2>/dev/null
+}
+
+test_http() {
+  local name="\$1"
+  local url="\$2"
+  local code
+  code="\$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" "\${url}" 2>/dev/null || echo "000")"
+  echo "\${name}: HTTP \${code}"
+  [[ "\${code}" != "000" ]]
+}
+
 case "\${1:-}" in
   status)
     echo "=== WARP 状态 ==="
-    warp-cli status 2>/dev/null || echo "未运行"
+    warp_cli status || echo "未运行"
     echo
     /usr/local/bin/warp-google status
     ;;
   start)
-    warp-cli connect 2>/dev/null || true
+    warp_cli connect || true
     /usr/local/bin/warp-google start
     ;;
   stop)
     /usr/local/bin/warp-google stop || true
-    warp-cli disconnect 2>/dev/null || true
+    warp_cli disconnect || true
     ;;
   restart)
     /usr/local/bin/warp-google restart
     ;;
   test)
-    echo "=== Google 连接测试 ==="
-    curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\\n" https://www.google.com || echo "失败"
-    echo
-    echo "=== Netflix 连接测试 ==="
-    curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\\n" https://www.netflix.com || echo "失败"
+    echo "=== 透明代理连接测试 ==="
+    test_http "Google" "https://www.google.com" || true
+    test_http "Gemini" "https://gemini.google.com" || true
+    test_http "AI Studio" "https://aistudio.google.com" || true
+    test_http "Gemini API" "https://generativelanguage.googleapis.com" || true
+    test_http "Netflix" "https://www.netflix.com" || true
     echo
     echo "=== Netflix 非自制剧测试 ==="
-    nf_code=\$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.netflix.com/title/80018499 || echo "000")
+    nf_code=\$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" https://www.netflix.com/title/80018499 2>/dev/null || echo "000")
     if [[ "\${nf_code}" == "200" ]]; then
       echo "可观看非自制剧内容 (HTTP \${nf_code})"
     else
@@ -953,10 +1043,10 @@ case "\${1:-}" in
     ;;
   ip)
     echo "直连 IP:"
-    curl -4 -s --max-time 8 ip.sb || echo "获取失败"
+    curl -4 -sS --max-time 8 ip.sb 2>/dev/null || echo "获取失败"
     echo
     echo "WARP IP:"
-    curl -s --max-time 8 -x "socks5h://127.0.0.1:\${WARP_PROXY_PORT}" ip.sb || echo "获取失败"
+    curl -sS --max-time 8 -x "socks5h://127.0.0.1:\${WARP_PROXY_PORT}" ip.sb 2>/dev/null || echo "获取失败"
     echo
     ;;
   update)
@@ -1006,12 +1096,16 @@ case "\${1:-}" in
 
     systemctl disable --now warp-keepalive.timer 2>/dev/null || true
     systemctl disable --now warp-keepalive.service 2>/dev/null || true
+    systemctl disable --now warp-google-update.timer 2>/dev/null || true
+    systemctl disable --now warp-google-update.service 2>/dev/null || true
     systemctl disable --now warp-google 2>/dev/null || true
     systemctl disable --now redsocks 2>/dev/null || true
     systemctl disable --now warp-svc 2>/dev/null || true
 
     rm -f /etc/systemd/system/warp-keepalive.timer
     rm -f /etc/systemd/system/warp-keepalive.service
+    rm -f /etc/systemd/system/warp-google-update.timer
+    rm -f /etc/systemd/system/warp-google-update.service
     rm -f /etc/systemd/system/warp-google.service
     rm -f /etc/systemd/system/redsocks.service
 
@@ -1136,6 +1230,7 @@ do_install() {
   write_warp_cli
   write_keepalive
   write_systemd_service
+  write_update_timer
 
   configure_warp
 
