@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.0
+# Version: 2.0.1
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -698,6 +698,7 @@ EOF_SINGBOX_DROPIN
   # 清理 v1 的整段 IP 接管，避免覆盖 sing-box 的域名决策。
   /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
   systemctl disable --now warp-google.service >/dev/null 2>&1 || true
+  systemctl reset-failed warp-google.service >/dev/null 2>&1 || true
   systemctl disable --now redsocks.service >/dev/null 2>&1 || true
 
   systemctl daemon-reload
@@ -1037,14 +1038,6 @@ start_redsocks() {
   fi
 }
 
-stop_redsocks() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop redsocks >/dev/null 2>&1 || true
-  else
-    pkill -x redsocks 2>/dev/null || true
-  fi
-}
-
 ensure_ipset() { ipset create "${IPSET_NAME}" hash:net family inet -exist; }
 
 load_ipv4_list() {
@@ -1257,7 +1250,6 @@ stop() {
   delete_jump_all filter OUTPUT "${NETFLIX_QUIC_CHAIN}"
   iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
-  stop_redsocks
   info "完成"
 }
 
@@ -1422,6 +1414,7 @@ case "\${1:-}" in
     ;;
   stop)
     /usr/local/bin/warp-google stop || true
+    systemctl stop redsocks.service >/dev/null 2>&1 || true
     warp_cli disconnect || true
     ;;
   restart)
@@ -1531,9 +1524,9 @@ case "\${1:-}" in
       exit 1
     fi
 
-    bash "\${tmp}" --install
-    rm -f "\${tmp}" "\${sum_tmp}"
-    echo "[warp] 升级完成"
+    rm -f "\${sum_tmp}"
+    export WARP_UPGRADE_TMP="\${tmp}"
+    exec bash "\${tmp}" --install
     ;;
   uninstall)
     read -r -p "确定要卸载？[y/N]: " confirm
@@ -1659,6 +1652,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/warp-google start
 ExecStop=/usr/local/bin/warp-google stop
+TimeoutStopSec=15s
 
 [Install]
 WantedBy=multi-user.target
@@ -1718,6 +1712,10 @@ do_install() {
   /usr/local/bin/warp status || true
   echo
   /usr/local/bin/warp test || true
+
+  if [[ -n "${WARP_UPGRADE_TMP:-}" && "${WARP_UPGRADE_TMP}" == /tmp/* ]]; then
+    rm -f "${WARP_UPGRADE_TMP}" 2>/dev/null || true
+  fi
 }
 
 do_status() {

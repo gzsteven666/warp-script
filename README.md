@@ -86,7 +86,7 @@ systemctl restart sing-box
 
 ## DNS 和 IPv4
 
-从 2.0.0 开始，脚本默认不修改系统 DNS，也不全局强制 IPv4。
+从 2.0.1 开始，脚本默认不修改系统 DNS，也不全局强制 IPv4。
 
 确实需要时可以在安装时启用：
 
