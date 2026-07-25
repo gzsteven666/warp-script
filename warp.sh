@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.1
+# Version: 2.0.2
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -317,7 +317,8 @@ install_prereqs() {
 
 install_warp_client() {
   if command_exists warp-cli; then
-    success "已检测到 warp-cli，跳过安装"
+    systemctl enable --now warp-svc >/dev/null 2>&1 || true
+    success "已检测到 warp-cli，并确认 warp-svc 已启动"
     return 0
   fi
 
