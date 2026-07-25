@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# WARP Script - Google & Netflix unlock via Cloudflare WARP (ipset)
+# WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 1.4.1
+# Version: 2.0.0
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="2.0.0"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -27,6 +27,14 @@ NETFLIX_NAT_CHAIN="${NETFLIX_NAT_CHAIN:-WARP_NETFLIX}"
 NETFLIX_QUIC_CHAIN="${NETFLIX_QUIC_CHAIN:-WARP_NETFLIX_QUIC}"
 
 CACHE_DIR="/etc/warp-google"
+ROUTING_MODE_FILE="${CACHE_DIR}/routing_mode"
+SINGBOX_CONFIG_FILE="${CACHE_DIR}/singbox_config"
+GEMINI_DOMAINS_FILE="${CACHE_DIR}/gemini_domains.txt"
+NETFLIX_DOMAINS_FILE="${CACHE_DIR}/netflix_domains.txt"
+NETFLIX_MODE_FILE="${CACHE_DIR}/netflix_mode"
+SINGBOX_PATCHER="/usr/local/bin/warp-singbox-route"
+SINGBOX_DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
+SINGBOX_DROPIN_FILE="${SINGBOX_DROPIN_DIR}/20-warp-routing.conf"
 GOOG_JSON_URL="https://www.gstatic.com/ipranges/goog.json"
 IPV4_CACHE_FILE="${CACHE_DIR}/google_ipv4.txt"
 NETFLIX_IPV4_CACHE_FILE="${CACHE_DIR}/netflix_ipv4.txt"
@@ -190,8 +198,8 @@ detect_system() {
 }
 
 setup_cloudflare_dns() {
-  if [[ "${WARP_SKIP_DNS:-0}" == "1" ]]; then
-    warn "已跳过 DNS 配置 (WARP_SKIP_DNS=1)"
+  if [[ "${WARP_CONFIGURE_DNS:-0}" != "1" ]]; then
+    info "保留系统 DNS（如需改为 Cloudflare DNS，请设置 WARP_CONFIGURE_DNS=1）"
     return 0
   fi
 
@@ -266,6 +274,17 @@ restore_dns() {
   esac
 
   rm -f "${DNS_MODE_FILE}"
+}
+
+migrate_legacy_network_tweaks() {
+  if [[ "${WARP_CONFIGURE_DNS:-0}" != "1" && -f "${DNS_MODE_FILE}" ]]; then
+    info "恢复脚本旧版本修改的系统 DNS..."
+    restore_dns
+  fi
+
+  if [[ "${WARP_PREFER_IPV4:-0}" != "1" ]]; then
+    sed -i "/${GAI_MARK}/,+1d" /etc/gai.conf 2>/dev/null || true
+  fi
 }
 
 install_prereqs() {
@@ -354,7 +373,9 @@ EOF_REPO
 
 configure_warp() {
   info "配置 WARP..."
-  warp_cli registration new >/dev/null || warp_cli register >/dev/null || true
+  if ! warp_cli registration show >/dev/null 2>&1; then
+    warp_cli registration new >/dev/null || warp_cli register >/dev/null || true
+  fi
   warp_cli tunnel protocol set MASQUE >/dev/null || true
   warp_cli mode proxy >/dev/null || true
   warp_cli proxy port "${WARP_PROXY_PORT}" >/dev/null || true
@@ -367,6 +388,10 @@ configure_warp() {
 }
 
 setup_gai_conf() {
+  if [[ "${WARP_PREFER_IPV4:-0}" != "1" ]]; then
+    return 0
+  fi
+
   if ! grep -qF "${GAI_MARK}" /etc/gai.conf 2>/dev/null; then
     {
       echo "${GAI_MARK}"
@@ -374,6 +399,311 @@ setup_gai_conf() {
     } >> /etc/gai.conf
     success "已配置 IPv4 优先"
   fi
+}
+
+detect_singbox_config() {
+  local candidate
+  for candidate in \
+    "${SINGBOX_CONFIG:-}" \
+    "/etc/v2ray-agent/sing-box/conf/config.json" \
+    "/etc/sing-box/config.json" \
+    "/usr/local/etc/sing-box/config.json"; do
+    if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_domain_lists() {
+  mkdir -p "${CACHE_DIR}"
+
+  if [[ ! -s "${GEMINI_DOMAINS_FILE}" ]]; then
+    cat > "${GEMINI_DOMAINS_FILE}" <<'EOF_GEMINI_DOMAINS'
+gemini.google.com
+aistudio.google.com
+ai.google.dev
+makersuite.google.com
+bard.google.com
+generativelanguage.googleapis.com
+content-generativelanguage.googleapis.com
+alkalimakersuite-pa.clients6.google.com
+aisandbox-pa.googleapis.com
+proaisandbox-pa.googleapis.com
+EOF_GEMINI_DOMAINS
+  fi
+
+  if [[ ! -s "${NETFLIX_DOMAINS_FILE}" ]]; then
+    cat > "${NETFLIX_DOMAINS_FILE}" <<'EOF_NETFLIX_DOMAINS'
+netflix.com
+netflix.net
+nflxvideo.net
+nflximg.net
+nflximg.com
+nflxso.net
+nflxext.com
+fast.com
+EOF_NETFLIX_DOMAINS
+  fi
+
+  [[ -s "${NETFLIX_MODE_FILE}" ]] || echo "off" > "${NETFLIX_MODE_FILE}"
+}
+
+write_singbox_patcher() {
+  info "创建 sing-box 域名分流补丁..."
+
+  cat > "${SINGBOX_PATCHER}" <<'EOF_SINGBOX_PATCHER'
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CACHE_DIR = Path(os.environ.get("WARP_CACHE_DIR", "/etc/warp-google"))
+MODE_FILE = CACHE_DIR / "routing_mode"
+CONFIG_FILE = CACHE_DIR / "singbox_config"
+GEMINI_FILE = CACHE_DIR / "gemini_domains.txt"
+NETFLIX_FILE = CACHE_DIR / "netflix_domains.txt"
+NETFLIX_MODE_FILE = CACHE_DIR / "netflix_mode"
+MANAGED_MARKER = "__warp_script_v2_managed__"
+WARP_TAG = "warp-out"
+DIRECT_TAG = "warp-direct"
+WARP_PORT = int(os.environ.get("WARP_PROXY_PORT", "40000"))
+
+
+def read_text(path, default=""):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def read_domains(path):
+    values = []
+    for line in read_text(path).splitlines():
+        value = line.strip().lower().rstrip(".")
+        if value and not value.startswith("#") and value not in values:
+            values.append(value)
+    return values
+
+
+def find_binary(config_path):
+    candidates = [
+        os.environ.get("WARP_SINGBOX_BIN"),
+        shutil.which("sing-box"),
+        str(config_path.parent.parent / "sing-box"),
+        "/usr/local/bin/sing-box",
+        "/usr/bin/sing-box",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError("找不到 sing-box 可执行文件")
+
+
+def is_managed_rule(rule):
+    if rule.get("outbound") == WARP_TAG:
+        return True
+    return MANAGED_MARKER in rule.get("domain_keyword", [])
+
+
+def clean_config(data):
+    route = data.setdefault("route", {})
+    route["rules"] = [
+        rule for rule in route.get("rules", [])
+        if not is_managed_rule(rule)
+    ]
+
+    outbounds = data.get("outbounds", [])
+    outbounds = [
+        outbound for outbound in outbounds
+        if outbound.get("tag") not in (WARP_TAG, DIRECT_TAG)
+    ]
+    if outbounds:
+        data["outbounds"] = outbounds
+    else:
+        data.pop("outbounds", None)
+
+    if route.get("final") == DIRECT_TAG:
+        route.pop("final", None)
+    return data
+
+
+def domain_fields(domains):
+    return {
+        "domain": domains,
+        "domain_suffix": [f".{domain}" for domain in domains],
+        "domain_keyword": [MANAGED_MARKER],
+    }
+
+
+def apply_config(data):
+    data = clean_config(data)
+    route = data.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    if not any(rule.get("action") == "sniff" for rule in rules):
+        rules.insert(0, {"action": "sniff"})
+
+    outbounds = data.get("outbounds", [])
+    if not outbounds:
+        outbounds.append({"type": "direct", "tag": DIRECT_TAG})
+        route["final"] = DIRECT_TAG
+
+    outbounds.append({
+        "type": "socks",
+        "tag": WARP_TAG,
+        "server": "127.0.0.1",
+        "server_port": WARP_PORT,
+        "version": "5",
+        "network": "tcp",
+    })
+    data["outbounds"] = outbounds
+
+    domains = read_domains(GEMINI_FILE)
+    if read_text(NETFLIX_MODE_FILE, "off") == "on":
+        domains.extend(
+            domain for domain in read_domains(NETFLIX_FILE)
+            if domain not in domains
+        )
+    if not domains:
+        raise RuntimeError("域名列表为空")
+
+    fields = domain_fields(domains)
+    managed_rules = [
+        {
+            **fields,
+            "network": ["udp"],
+            "port": 443,
+            "action": "reject",
+        },
+        {
+            **fields,
+            "network": ["tcp"],
+            "action": "route",
+            "outbound": WARP_TAG,
+        },
+    ]
+
+    insert_at = 0
+    for index, rule in enumerate(rules):
+        if rule.get("action") in ("sniff", "resolve", "route-options"):
+            insert_at = index + 1
+    rules[insert_at:insert_at] = managed_rules
+    return data
+
+
+def validate(binary, config_path):
+    result = subprocess.run(
+        [binary, "check", "-c", str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stdout.strip() or "sing-box 配置检查失败")
+
+
+def write_transaction(config_path, data):
+    binary = find_binary(config_path)
+    original = config_path.read_bytes()
+    stat = config_path.stat()
+    rendered = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode()
+    if rendered == original:
+        validate(binary, config_path)
+        print("[warp-route] 配置已是最新")
+        return
+
+    backup = config_path.with_name(config_path.name + ".warp-script-txn")
+    backup.write_bytes(original)
+    os.chmod(backup, stat.st_mode)
+
+    fd, temp_name = tempfile.mkstemp(prefix=".warp-route-", dir=config_path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, stat.st_mode)
+        try:
+            os.chown(temp_name, stat.st_uid, stat.st_gid)
+        except PermissionError:
+            pass
+        os.replace(temp_name, config_path)
+        validate(binary, config_path)
+    except Exception:
+        config_path.write_bytes(original)
+        os.chmod(config_path, stat.st_mode)
+        raise
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+        try:
+            backup.unlink()
+        except OSError:
+            pass
+    print("[warp-route] sing-box 域名分流已更新")
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "apply"
+    config_value = read_text(CONFIG_FILE)
+    if not config_value:
+        raise RuntimeError("未记录 sing-box 配置路径")
+    config_path = Path(config_value)
+    if not config_path.is_file():
+        raise RuntimeError(f"sing-box 配置不存在: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if command == "remove" or read_text(MODE_FILE) != "gemini-only":
+        data = clean_config(data)
+    elif command == "apply":
+        data = apply_config(data)
+    else:
+        raise RuntimeError("用法: warp-singbox-route {apply|remove}")
+
+    write_transaction(config_path, data)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"[warp-route] 错误: {exc}", file=sys.stderr)
+        sys.exit(1)
+EOF_SINGBOX_PATCHER
+
+  chmod +x "${SINGBOX_PATCHER}"
+}
+
+configure_singbox_routing() {
+  local config_path
+  config_path="$(detect_singbox_config)" || return 1
+
+  mkdir -p "${CACHE_DIR}" "${SINGBOX_DROPIN_DIR}"
+  printf '%s\n' "${config_path}" > "${SINGBOX_CONFIG_FILE}"
+  printf '%s\n' "gemini-only" > "${ROUTING_MODE_FILE}"
+
+  cat > "${SINGBOX_DROPIN_FILE}" <<EOF_SINGBOX_DROPIN
+[Service]
+ExecStartPre=+${SINGBOX_PATCHER} apply
+EOF_SINGBOX_DROPIN
+
+  # 清理 v1 的整段 IP 接管，避免覆盖 sing-box 的域名决策。
+  /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
+  systemctl disable --now warp-google.service >/dev/null 2>&1 || true
+  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
+
+  systemctl daemon-reload
+  "${SINGBOX_PATCHER}" apply
+  systemctl restart sing-box
+  success "已启用 Gemini 域名分流: ${config_path}"
 }
 
 write_redsocks_conf() {
@@ -437,22 +767,13 @@ set -euo pipefail
 LOG_TAG="warp-keepalive"
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 LOCK_FILE="${WARP_KEEPALIVE_LOCK:-/run/warp-keepalive.lock}"
+FAIL_FILE="/run/warp-keepalive.failures"
+MODE_FILE="/etc/warp-google/routing_mode"
 
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   exit 0
 fi
-
-restart_redsocks() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart redsocks >/dev/null 2>&1 && return 0
-    logger -t "${LOG_TAG}" "systemctl restart redsocks failed"
-    return 1
-  fi
-  pkill -x redsocks 2>/dev/null || true
-  sleep 1
-  redsocks -c /etc/redsocks.conf >/dev/null 2>&1 &
-}
 
 warp_cli() {
   warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
@@ -463,13 +784,34 @@ check_warp_proxy() {
     https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -Eq '^warp=(on|plus)$'
 }
 
-check_transparent_url() {
+check_warp_url() {
   local url="$1"
   local code
-  code="$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")"
+  code="$(curl -4 -sS --max-time 12 -x "socks5h://127.0.0.1:${WARP_PROXY_PORT}" \
+    -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")"
   [[ "${code}" != "000" ]]
 }
 
+if check_warp_proxy && check_warp_url "https://gemini.google.com"; then
+  rm -f "${FAIL_FILE}"
+  if [[ "$(cat "${MODE_FILE}" 2>/dev/null || true)" == "gemini-only" ]] &&
+     command -v /usr/local/bin/warp-singbox-route >/dev/null 2>&1; then
+    /usr/local/bin/warp-singbox-route apply >/dev/null 2>&1 || \
+      logger -t "${LOG_TAG}" "sing-box route apply failed"
+  fi
+  exit 0
+fi
+
+failures="$(cat "${FAIL_FILE}" 2>/dev/null || echo 0)"
+[[ "${failures}" =~ ^[0-9]+$ ]] || failures=0
+failures=$((failures + 1))
+printf '%s\n' "${failures}" > "${FAIL_FILE}"
+if (( failures < 2 )); then
+  logger -t "${LOG_TAG}" "WARP health check failed once; waiting for confirmation"
+  exit 0
+fi
+
+logger -t "${LOG_TAG}" "WARP health check failed twice; reconnecting"
 if ! check_warp_proxy; then
   logger -t "${LOG_TAG}" "WARP proxy trace failed, trying to reconnect..."
   warp_cli disconnect || true
@@ -485,15 +827,14 @@ if ! check_warp_proxy; then
   warp_cli connect || true
 fi
 
-if ! check_transparent_url "https://generativelanguage.googleapis.com" && ! check_transparent_url "https://gemini.google.com"; then
-  logger -t "${LOG_TAG}" "Gemini/Google transparent proxy failed, reapplying rules..."
-  if command -v /usr/local/bin/warp-google >/dev/null 2>&1; then
-    /usr/local/bin/warp-google restart >/dev/null 2>&1 && logger -t "${LOG_TAG}" "warp-google restarted" || true
-  elif restart_redsocks; then
-    logger -t "${LOG_TAG}" "redsocks restarted"
-  else
-    logger -t "${LOG_TAG}" "redsocks restart failed"
-  fi
+if check_warp_proxy && check_warp_url "https://gemini.google.com"; then
+  rm -f "${FAIL_FILE}"
+  logger -t "${LOG_TAG}" "WARP recovered"
+elif [[ "$(cat "${MODE_FILE}" 2>/dev/null || true)" == "google-all" ]]; then
+  /usr/local/bin/warp-google restart >/dev/null 2>&1 || true
+  logger -t "${LOG_TAG}" "legacy Google rules reapplied"
+else
+  logger -t "${LOG_TAG}" "WARP remains unhealthy after recovery"
 fi
 EOF_KEEPALIVE
 
@@ -512,11 +853,11 @@ EOF_KEEPALIVE_SERVICE
 
   cat > /etc/systemd/system/warp-keepalive.timer <<'EOF_KEEPALIVE_TIMER'
 [Unit]
-Description=Run WARP keepalive every 10 minutes
+Description=Run WARP keepalive every 5 minutes
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=10min
+OnUnitActiveSec=5min
 Persistent=true
 
 [Install]
@@ -530,27 +871,26 @@ EOF_KEEPALIVE_TIMER
     (crontab -l 2>/dev/null | grep -v warp-keepalive || true) | crontab - 2>/dev/null || true
   fi
 
-  success "keepalive 已配置（systemd timer 每 10 分钟检测）"
+  success "keepalive 已配置（每 5 分钟检测，连续失败两次才恢复）"
 }
 
 write_update_timer() {
-  info "创建 IP 段自动更新 systemd timer..."
+  info "创建每日维护 systemd timer..."
 
   cat > /etc/systemd/system/warp-google-update.service <<'EOF_UPDATE_SERVICE'
 [Unit]
-Description=Update WARP Google and Netflix IP sets
+Description=Maintain WARP routing
 After=network-online.target warp-svc.service
 Wants=network-online.target warp-svc.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/warp-google update
-ExecStart=/usr/local/bin/warp-google restart
+ExecStart=/usr/local/bin/warp update
 EOF_UPDATE_SERVICE
 
   cat > /etc/systemd/system/warp-google-update.timer <<'EOF_UPDATE_TIMER'
 [Unit]
-Description=Update WARP Google and Netflix IP sets daily
+Description=Maintain WARP routing daily
 
 [Timer]
 OnBootSec=5min
@@ -564,7 +904,7 @@ EOF_UPDATE_TIMER
 
   systemctl daemon-reload
   systemctl enable --now warp-google-update.timer >/dev/null 2>&1 || true
-  success "IP 段自动更新已配置（每日执行，带随机延迟）"
+  success "每日维护已配置（带随机延迟）"
 }
 
 write_warp_google() {
@@ -889,6 +1229,10 @@ update() {
 }
 
 start() {
+  if [[ "$(cat "${CACHE_DIR}/routing_mode" 2>/dev/null || true)" == "gemini-only" ]]; then
+    info "当前为 gemini-only 模式，不启用整段 IP 规则"
+    return 0
+  fi
   info "启动..."
   warp_connect
   start_redsocks
@@ -972,6 +1316,10 @@ GAI_MARK="${GAI_MARK}"
 SCRIPT_VERSION="${SCRIPT_VERSION}"
 DNS_MODE_FILE="${DNS_MODE_FILE}"
 RESOLVED_DROPIN_FILE="${RESOLVED_DROPIN_FILE}"
+MODE_FILE="${ROUTING_MODE_FILE}"
+NETFLIX_MODE_FILE="${NETFLIX_MODE_FILE}"
+SINGBOX_PATCHER="${SINGBOX_PATCHER}"
+SINGBOX_DROPIN_FILE="${SINGBOX_DROPIN_FILE}"
 SHA256SUM_BIN="\$(command -v sha256sum 2>/dev/null || command -v shasum 2>/dev/null || true)"
 
 verify_checksum() {
@@ -1012,48 +1360,95 @@ warp_cli() {
 test_http() {
   local name="\$1"
   local url="\$2"
+  local proxy="\${3:-}"
   local code
-  code="\$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" "\${url}" 2>/dev/null || echo "000")"
+  if [[ -n "\${proxy}" ]]; then
+    code="\$(curl -4 -sS --max-time 12 -x "\${proxy}" -o /dev/null -w "%{http_code}" "\${url}" 2>/dev/null || echo "000")"
+  else
+    code="\$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" "\${url}" 2>/dev/null || echo "000")"
+  fi
   echo "\${name}: HTTP \${code}"
   [[ "\${code}" != "000" ]]
 }
 
+routing_mode() {
+  cat "\${MODE_FILE}" 2>/dev/null || echo "google-all"
+}
+
+apply_smart_routing() {
+  /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
+  systemctl disable --now warp-google.service >/dev/null 2>&1 || true
+  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
+  "\${SINGBOX_PATCHER}" apply
+  systemctl restart sing-box
+}
+
+enable_legacy_routing() {
+  "\${SINGBOX_PATCHER}" remove 2>/dev/null || true
+  systemctl restart sing-box 2>/dev/null || true
+  systemctl enable --now redsocks.service >/dev/null 2>&1 || true
+  systemctl enable warp-google.service >/dev/null 2>&1 || true
+  /usr/local/bin/warp-google update || true
+  /usr/local/bin/warp-google restart
+}
+
 case "\${1:-}" in
   status)
+    echo "WARP Script v\${SCRIPT_VERSION}"
+    echo "路由模式: \$(routing_mode)"
+    echo "Netflix: \$(cat "\${NETFLIX_MODE_FILE}" 2>/dev/null || echo off)"
+    echo
     echo "=== WARP 状态 ==="
     warp_cli status || echo "未运行"
     echo
-    /usr/local/bin/warp-google status
+    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
+      echo "=== sing-box 域名分流 ==="
+      systemctl is-active --quiet sing-box && echo "sing-box: 运行中" || echo "sing-box: 未运行"
+      grep -q '"tag": "warp-out"' "\$(cat /etc/warp-google/singbox_config 2>/dev/null)" 2>/dev/null &&
+        echo "warp-out: 已配置" || echo "warp-out: 未配置"
+      iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null &&
+        echo "旧 Google IP 规则: 仍存在" || echo "旧 Google IP 规则: 已移除"
+    else
+      /usr/local/bin/warp-google status
+    fi
     ;;
   start)
     warp_cli connect || true
-    /usr/local/bin/warp-google start
+    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
+      apply_smart_routing
+    else
+      enable_legacy_routing
+    fi
     ;;
   stop)
     /usr/local/bin/warp-google stop || true
     warp_cli disconnect || true
     ;;
   restart)
-    /usr/local/bin/warp-google restart
+    warp_cli disconnect || true
+    sleep 1
+    warp_cli connect || true
+    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
+      apply_smart_routing
+    else
+      /usr/local/bin/warp-google restart
+    fi
     ;;
   test)
-    echo "=== 透明代理连接测试 ==="
-    test_http "Google" "https://www.google.com" || true
-    test_http "Gemini" "https://gemini.google.com" || true
-    test_http "AI Studio" "https://aistudio.google.com" || true
-    test_http "Gemini API" "https://generativelanguage.googleapis.com" || true
-    test_http "Netflix" "https://www.netflix.com" || true
+    proxy="socks5h://127.0.0.1:\${WARP_PROXY_PORT}"
+    echo "=== 直连测试 ==="
+    test_http "Google Search" "https://www.google.com/generate_204" || true
+    test_http "ChatGPT" "https://chatgpt.com/cdn-cgi/trace" || true
+    test_http "OpenAI API" "https://api.openai.com/cdn-cgi/trace" || true
     echo
-    echo "=== Netflix 非自制剧测试 ==="
-    nf_code=\$(curl -4 -sS --max-time 12 -o /dev/null -w "%{http_code}" https://www.netflix.com/title/80018499 2>/dev/null || echo "000")
-    if [[ "\${nf_code}" == "200" ]]; then
-      echo "可观看非自制剧内容 (HTTP \${nf_code})"
-    else
-      echo "非自制剧不可用 (HTTP \${nf_code})"
-    fi
+    echo "=== WARP 测试 ==="
+    test_http "Gemini" "https://gemini.google.com" "\${proxy}" || true
+    test_http "AI Studio" "https://aistudio.google.com" "\${proxy}" || true
+    test_http "Gemini API" "https://generativelanguage.googleapis.com" "\${proxy}" || true
     echo
     echo "=== WARP Trace ==="
-    curl -s --max-time 10 -x "socks5h://127.0.0.1:\${WARP_PROXY_PORT}" https://www.cloudflare.com/cdn-cgi/trace | grep -E "^warp=" || echo "未检测到"
+    curl -s --max-time 10 -x "\${proxy}" https://www.cloudflare.com/cdn-cgi/trace |
+      grep -E "^(ip|loc|warp)=" || echo "未检测到"
     ;;
   ip)
     echo "直连 IP:"
@@ -1064,8 +1459,52 @@ case "\${1:-}" in
     echo
     ;;
   update)
-    /usr/local/bin/warp-google update
-    /usr/local/bin/warp-google restart
+    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
+      "\${SINGBOX_PATCHER}" apply
+    else
+      /usr/local/bin/warp-google update
+      /usr/local/bin/warp-google restart
+    fi
+    ;;
+  mode)
+    case "\${2:-}" in
+      gemini-only)
+        echo "gemini-only" > "\${MODE_FILE}"
+        apply_smart_routing
+        echo "[warp] 已切换为 Gemini 域名分流"
+        ;;
+      google-all)
+        echo "google-all" > "\${MODE_FILE}"
+        enable_legacy_routing
+        echo "[warp] 已切换为整个 Google IP 段走 WARP"
+        ;;
+      *)
+        echo "当前模式: \$(routing_mode)"
+        echo "用法: warp mode {gemini-only|google-all}"
+        ;;
+    esac
+    ;;
+  netflix)
+    case "\${2:-}" in
+      on|off)
+        [[ "\$(routing_mode)" == "gemini-only" ]] || {
+          echo "[warp] Netflix 域名开关仅适用于 gemini-only 模式" >&2
+          exit 1
+        }
+        echo "\${2}" > "\${NETFLIX_MODE_FILE}"
+        apply_smart_routing
+        echo "[warp] Netflix WARP: \${2}"
+        ;;
+      test)
+        proxy="socks5h://127.0.0.1:\${WARP_PROXY_PORT}"
+        test_http "Netflix 直连" "https://www.netflix.com/title/80018499" || true
+        test_http "Netflix WARP" "https://www.netflix.com/title/80018499" "\${proxy}" || true
+        ;;
+      *)
+        echo "Netflix WARP: \$(cat "\${NETFLIX_MODE_FILE}" 2>/dev/null || echo off)"
+        echo "用法: warp netflix {on|off|test}"
+        ;;
+    esac
     ;;
   upgrade)
     echo "[warp] 升级中..."
@@ -1078,16 +1517,12 @@ case "\${1:-}" in
       exit 1
     fi
 
-    do_verify=0
-    if curl -fsSL "\${REPO_SHA256_URL}" -o "\${sum_tmp}" 2>/dev/null && [[ -s "\${sum_tmp}" ]]; then
-      do_verify=1
-    else
-      echo "[warp] 未找到校验文件，跳过 SHA256 校验"
-    fi
-
-    if [[ "\${do_verify}" -eq 1 ]]; then
-      verify_checksum "\${tmp}" "\${sum_tmp}" || { rm -f "\${tmp}" "\${sum_tmp}"; exit 1; }
-    fi
+    curl -fsSL "\${REPO_SHA256_URL}" -o "\${sum_tmp}" 2>/dev/null && [[ -s "\${sum_tmp}" ]] || {
+      echo "[warp] 无法获取 SHA256 校验文件，拒绝升级" >&2
+      rm -f "\${tmp}" "\${sum_tmp}"
+      exit 1
+    }
+    verify_checksum "\${tmp}" "\${sum_tmp}" || { rm -f "\${tmp}" "\${sum_tmp}"; exit 1; }
 
     chmod +x "\${tmp}"
     if ! bash -n "\${tmp}"; then
@@ -1105,6 +1540,10 @@ case "\${1:-}" in
     [[ "\${confirm}" =~ ^[Yy]$ ]] || { echo "已取消"; exit 0; }
 
     echo "正在卸载..."
+    "\${SINGBOX_PATCHER}" remove 2>/dev/null || true
+    rm -f "\${SINGBOX_DROPIN_FILE}"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart sing-box 2>/dev/null || true
     /usr/local/bin/warp-google stop 2>/dev/null || true
     warp-cli disconnect 2>/dev/null || true
 
@@ -1125,6 +1564,7 @@ case "\${1:-}" in
 
     rm -f /usr/local/bin/warp-google
     rm -f /usr/local/bin/warp-keepalive
+    rm -f "\${SINGBOX_PATCHER}"
     rm -f /etc/redsocks.conf
     rm -rf /etc/warp-google
     systemctl daemon-reload 2>/dev/null || true
@@ -1191,10 +1631,12 @@ case "\${1:-}" in
     echo "  start     启动"
     echo "  stop      停止"
     echo "  restart   重启"
-    echo "  test      测试连接（Google + Netflix）"
+    echo "  test      测试直连与 WARP"
     echo "  ip        查看 IP"
-    echo "  update    更新 Google & Netflix IP 段"
-    echo "  upgrade   升级脚本（有校验文件时校验 SHA256）"
+    echo "  mode      切换 gemini-only / google-all"
+    echo "  netflix   Netflix WARP 开关与测试"
+    echo "  update    更新当前路由"
+    echo "  upgrade   校验并升级脚本"
     echo "  uninstall 卸载"
     ;;
 esac
@@ -1228,11 +1670,13 @@ EOF_WARP_SERVICE
 }
 
 do_install() {
+  local requested_mode config_path backup_path
   show_banner
   info "开始安装 v${SCRIPT_VERSION} ..."
   log "install v${SCRIPT_VERSION}"
 
   install_prereqs
+  migrate_legacy_network_tweaks
   setup_cloudflare_dns
   install_warp_client
 
@@ -1240,7 +1684,9 @@ do_install() {
   write_redsocks_conf
   write_redsocks_service
 
+  write_domain_lists
   write_warp_google
+  write_singbox_patcher
   write_warp_cli
   write_keepalive
   write_systemd_service
@@ -1248,30 +1694,30 @@ do_install() {
 
   configure_warp
 
-  /usr/local/bin/warp-google update || warn "IP 段更新失败，使用静态列表"
-  /usr/local/bin/warp-google start || true
+  requested_mode="${WARP_ROUTING_MODE:-$(cat "${ROUTING_MODE_FILE}" 2>/dev/null || true)}"
+  [[ -n "${requested_mode}" ]] || requested_mode="gemini-only"
+
+  if [[ "${requested_mode}" == "gemini-only" ]] && config_path="$(detect_singbox_config)"; then
+    backup_path="${config_path}.bak-warp-v2-$(date +%Y%m%d-%H%M%S)"
+    cp -a "${config_path}" "${backup_path}"
+    info "sing-box 配置备份: ${backup_path}"
+    configure_singbox_routing
+  else
+    warn "未启用 sing-box 域名分流，使用 google-all 兼容模式"
+    echo "google-all" > "${ROUTING_MODE_FILE}"
+    "${SINGBOX_PATCHER}" remove 2>/dev/null || true
+    systemctl enable --now redsocks.service >/dev/null 2>&1 || true
+    systemctl enable warp-google.service >/dev/null 2>&1 || true
+    /usr/local/bin/warp-google update || warn "IP 段更新失败，使用静态列表"
+    /usr/local/bin/warp-google start || true
+  fi
 
   echo
   success "安装完成"
-  echo -e "\n管理命令: ${GREEN}warp {status|start|stop|restart|test|ip|update|upgrade|uninstall}${NC}\n"
-
-  echo -e "${CYAN}测试连接...${NC}"
-  sleep 2
-  local code
-  code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com || echo "000")
-  if [[ "${code}" == "200" ]]; then
-    success "Google 连接成功"
-  else
-    warn "Google 测试返回: ${code}"
-  fi
-
-  local nf_code
-  nf_code=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.netflix.com || echo "000")
-  if [[ "${nf_code}" == "200" || "${nf_code}" == "301" || "${nf_code}" == "302" ]]; then
-    success "Netflix 连接成功"
-  else
-    warn "Netflix 测试返回: ${nf_code}"
-  fi
+  echo -e "\n管理命令: ${GREEN}warp {status|start|stop|restart|test|ip|mode|netflix|update|upgrade|uninstall}${NC}\n"
+  /usr/local/bin/warp status || true
+  echo
+  /usr/local/bin/warp test || true
 }
 
 do_status() {
