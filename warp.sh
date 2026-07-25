@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.2
+# Version: 2.0.3
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.0.3"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -1504,19 +1504,24 @@ case "\${1:-}" in
     echo "[warp] 升级中..."
     tmp="\$(mktemp)"
     sum_tmp="\$(mktemp)"
-
-    if ! curl -fsSL "\${REPO_RAW_URL}" -o "\${tmp}"; then
-      echo "[warp] 下载失败" >&2
+    verified=0
+    for attempt in 1 2 3; do
+      cache_bust="\$(date +%s)-\${RANDOM}-\${attempt}"
+      if curl -fsSL "\${REPO_RAW_URL}?v=\${cache_bust}" -o "\${tmp}" &&
+         curl -fsSL "\${REPO_SHA256_URL}?v=\${cache_bust}" -o "\${sum_tmp}" &&
+         [[ -s "\${sum_tmp}" ]] &&
+         verify_checksum "\${tmp}" "\${sum_tmp}"; then
+        verified=1
+        break
+      fi
+      echo "[warp] 下载内容暂未同步，2 秒后重试 (\${attempt}/3)" >&2
+      sleep 2
+    done
+    if [[ "\${verified}" -ne 1 ]]; then
+      echo "[warp] 下载或 SHA256 校验连续失败，拒绝升级" >&2
       rm -f "\${tmp}" "\${sum_tmp}"
       exit 1
     fi
-
-    curl -fsSL "\${REPO_SHA256_URL}" -o "\${sum_tmp}" 2>/dev/null && [[ -s "\${sum_tmp}" ]] || {
-      echo "[warp] 无法获取 SHA256 校验文件，拒绝升级" >&2
-      rm -f "\${tmp}" "\${sum_tmp}"
-      exit 1
-    }
-    verify_checksum "\${tmp}" "\${sum_tmp}" || { rm -f "\${tmp}" "\${sum_tmp}"; exit 1; }
 
     chmod +x "\${tmp}"
     if ! bash -n "\${tmp}"; then
