@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.3
+# Version: 2.0.4
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.0.4"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -139,7 +139,11 @@ log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 warp_cli() {
-  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+  if warp-cli --help 2>&1 | grep -q -- '--accept-tos'; then
+    warp-cli --accept-tos "$@" 2>/dev/null
+  else
+    warp-cli "$@" 2>/dev/null
+  fi
 }
 
 check_root() {
@@ -778,7 +782,11 @@ if ! flock -n 9; then
 fi
 
 warp_cli() {
-  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+  if warp-cli --help 2>&1 | grep -q -- '--accept-tos'; then
+    warp-cli --accept-tos "$@" 2>/dev/null
+  else
+    warp-cli "$@" 2>/dev/null
+  fi
 }
 
 check_warp_proxy() {
@@ -1015,7 +1023,11 @@ STATIC_NETFLIX_IPV4_CIDRS="
 info() { echo "[warp-google] $*"; }
 
 warp_cli() {
-  warp-cli --accept-tos "$@" 2>/dev/null || warp-cli "$@" 2>/dev/null
+  if warp-cli --help 2>&1 | grep -q -- '--accept-tos'; then
+    warp-cli --accept-tos "$@" 2>/dev/null
+  else
+    warp-cli "$@" 2>/dev/null
+  fi
 }
 
 warp_connect() { warp_cli connect || true; }
@@ -1347,7 +1359,11 @@ verify_checksum() {
 }
 
 warp_cli() {
-  warp-cli --accept-tos "\$@" 2>/dev/null || warp-cli "\$@" 2>/dev/null
+  if warp-cli --help 2>&1 | grep -q -- '--accept-tos'; then
+    warp-cli --accept-tos "\$@" 2>/dev/null
+  else
+    warp-cli "\$@" 2>/dev/null
+  fi
 }
 
 test_http() {
