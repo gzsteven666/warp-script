@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.4
+# Version: 2.0.5
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.4"
+SCRIPT_VERSION="2.0.5"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -137,6 +137,16 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+run_timed() {
+  local duration="$1"
+  shift
+  if command_exists timeout; then
+    timeout --foreground "${duration}" "$@"
+  else
+    "$@"
+  fi
+}
 
 warp_cli() {
   if warp-cli --help 2>&1 | grep -q -- '--accept-tos'; then
@@ -292,23 +302,38 @@ migrate_legacy_network_tweaks() {
 }
 
 install_prereqs() {
+  local dependency
+  local missing_dependency=0
+  local -a required_commands=(curl gpg iptables ipset python3 redsocks dig flock update-ca-certificates)
+
+  for dependency in "${required_commands[@]}"; do
+    if ! command_exists "${dependency}"; then
+      missing_dependency=1
+      break
+    fi
+  done
+  if [[ "${missing_dependency}" -eq 0 ]]; then
+    success "依赖已齐全，跳过软件源刷新"
+    return 0
+  fi
+
   info "安装依赖..."
   case "${OS}" in
     ubuntu|debian)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 redsocks dnsutils util-linux cron >/dev/null 2>&1 || {
+      run_timed 180 apt-get update -y >/dev/null 2>&1 || true
+      run_timed 300 apt-get install -y curl ca-certificates gnupg lsb-release iptables ipset python3 redsocks dnsutils util-linux cron >/dev/null 2>&1 || {
         error "依赖安装失败"
         return 1
       }
       ;;
     centos|rhel|rocky|almalinux|fedora)
       if command_exists dnf; then
-        dnf install -y epel-release >/dev/null 2>&1 || true
-        dnf install -y curl ca-certificates iptables ipset python3 redsocks bind-utils util-linux cronie >/dev/null 2>&1 || true
+        run_timed 300 dnf install -y epel-release >/dev/null 2>&1 || true
+        run_timed 300 dnf install -y curl ca-certificates iptables ipset python3 redsocks bind-utils util-linux cronie >/dev/null 2>&1 || true
       else
-        yum install -y epel-release >/dev/null 2>&1 || true
-        yum install -y curl ca-certificates iptables ipset python3 redsocks bind-utils util-linux cronie >/dev/null 2>&1 || true
+        run_timed 300 yum install -y epel-release >/dev/null 2>&1 || true
+        run_timed 300 yum install -y curl ca-certificates iptables ipset python3 redsocks bind-utils util-linux cronie >/dev/null 2>&1 || true
       fi
       ;;
     *)
