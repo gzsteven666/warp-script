@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # WARP Script - Selective Gemini and Netflix unlock via Cloudflare WARP
 # Author: gzsteven666
-# Version: 2.0.5
+# Version: 2.1.0
 #
 # 使用方法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/gzsteven666/warp-script/main/warp.sh)
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.5"
+SCRIPT_VERSION="2.1.0"
 
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 REDSOCKS_PORT="${REDSOCKS_PORT:-12345}"
@@ -712,18 +712,25 @@ EOF_SINGBOX_PATCHER
   chmod +x "${SINGBOX_PATCHER}"
 }
 
-configure_singbox_routing() {
+prepare_singbox_integration() {
   local config_path
   config_path="$(detect_singbox_config)" || return 1
 
   mkdir -p "${CACHE_DIR}" "${SINGBOX_DROPIN_DIR}"
   printf '%s\n' "${config_path}" > "${SINGBOX_CONFIG_FILE}"
-  printf '%s\n' "gemini-only" > "${ROUTING_MODE_FILE}"
 
   cat > "${SINGBOX_DROPIN_FILE}" <<EOF_SINGBOX_DROPIN
 [Service]
 ExecStartPre=+${SINGBOX_PATCHER} apply
 EOF_SINGBOX_DROPIN
+  systemctl daemon-reload
+}
+
+configure_singbox_routing() {
+  local config_path
+  prepare_singbox_integration || return 1
+  config_path="$(cat "${SINGBOX_CONFIG_FILE}")"
+  printf '%s\n' "gemini-only" > "${ROUTING_MODE_FILE}"
 
   # 清理 v1 的整段 IP 接管，避免覆盖 sing-box 的域名决策。
   /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
@@ -731,10 +738,23 @@ EOF_SINGBOX_DROPIN
   systemctl reset-failed warp-google.service >/dev/null 2>&1 || true
   systemctl disable --now redsocks.service >/dev/null 2>&1 || true
 
-  systemctl daemon-reload
   "${SINGBOX_PATCHER}" apply
   systemctl restart sing-box
   success "已启用 Gemini 域名分流: ${config_path}"
+}
+
+configure_direct_routing() {
+  printf '%s\n' "direct" > "${ROUTING_MODE_FILE}"
+  /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
+  systemctl disable --now warp-google.service >/dev/null 2>&1 || true
+  systemctl reset-failed warp-google.service >/dev/null 2>&1 || true
+  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
+
+  if prepare_singbox_integration; then
+    "${SINGBOX_PATCHER}" remove
+    systemctl restart sing-box
+  fi
+  success "已启用直连模式，Google 与 Gemini 不经过 WARP"
 }
 
 write_redsocks_conf() {
@@ -1162,6 +1182,15 @@ netflix_iptables_apply() {
   iptables -t filter -I OUTPUT 1 -j "${NETFLIX_QUIC_CHAIN}"
 }
 
+netflix_stop() {
+  delete_jump_all nat OUTPUT "${NETFLIX_NAT_CHAIN}"
+  iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
+  delete_jump_all filter OUTPUT "${NETFLIX_QUIC_CHAIN}"
+  iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+}
+
 update_google() {
   info "更新 Google IP 段..."
   local tmp
@@ -1256,12 +1285,14 @@ update() {
 
   mkdir -p "${CACHE_DIR}"
   update_google || true
-  update_netflix || true
+  if [[ "$(cat "${CACHE_DIR}/netflix_mode" 2>/dev/null || echo off)" == "on" ]]; then
+    update_netflix || true
+  fi
 }
 
 start() {
-  if [[ "$(cat "${CACHE_DIR}/routing_mode" 2>/dev/null || true)" == "gemini-only" ]]; then
-    info "当前为 gemini-only 模式，不启用整段 IP 规则"
+  if [[ "$(cat "${CACHE_DIR}/routing_mode" 2>/dev/null || true)" != "google-all" ]]; then
+    info "当前不是 google-all 模式，不启用整段 Google IP 规则"
     return 0
   fi
   info "启动..."
@@ -1269,8 +1300,12 @@ start() {
   start_redsocks
   ipset_apply
   iptables_apply
-  netflix_ipset_apply
-  netflix_iptables_apply
+  if [[ "$(cat "${CACHE_DIR}/netflix_mode" 2>/dev/null || echo off)" == "on" ]]; then
+    netflix_ipset_apply
+    netflix_iptables_apply
+  else
+    netflix_stop
+  fi
   info "完成"
 }
 
@@ -1282,12 +1317,7 @@ stop() {
   delete_jump_all filter OUTPUT "${QUIC_CHAIN}"
   iptables -t filter -F "${QUIC_CHAIN}" 2>/dev/null || true
   iptables -t filter -X "${QUIC_CHAIN}" 2>/dev/null || true
-  delete_jump_all nat OUTPUT "${NETFLIX_NAT_CHAIN}"
-  iptables -t nat -F "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
-  iptables -t nat -X "${NETFLIX_NAT_CHAIN}" 2>/dev/null || true
-  delete_jump_all filter OUTPUT "${NETFLIX_QUIC_CHAIN}"
-  iptables -t filter -F "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
-  iptables -t filter -X "${NETFLIX_QUIC_CHAIN}" 2>/dev/null || true
+  netflix_stop
   info "完成"
 }
 
@@ -1417,6 +1447,14 @@ apply_smart_routing() {
   systemctl restart sing-box
 }
 
+disable_all_routing() {
+  /usr/local/bin/warp-google stop >/dev/null 2>&1 || true
+  systemctl disable --now warp-google.service >/dev/null 2>&1 || true
+  systemctl disable --now redsocks.service >/dev/null 2>&1 || true
+  "\${SINGBOX_PATCHER}" remove 2>/dev/null || true
+  systemctl restart sing-box 2>/dev/null || true
+}
+
 enable_legacy_routing() {
   "\${SINGBOX_PATCHER}" remove 2>/dev/null || true
   systemctl restart sing-box 2>/dev/null || true
@@ -1442,17 +1480,20 @@ case "\${1:-}" in
         echo "warp-out: 已配置" || echo "warp-out: 未配置"
       iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null &&
         echo "旧 Google IP 规则: 仍存在" || echo "旧 Google IP 规则: 已移除"
-    else
+    elif [[ "\$(routing_mode)" == "google-all" ]]; then
       /usr/local/bin/warp-google status
+    else
+      echo "=== 直连模式 ==="
+      echo "Google/Gemini WARP 规则: 已禁用"
     fi
     ;;
   start)
     warp_cli connect || true
-    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
-      apply_smart_routing
-    else
-      enable_legacy_routing
-    fi
+    case "\$(routing_mode)" in
+      gemini-only) apply_smart_routing ;;
+      google-all) enable_legacy_routing ;;
+      direct) disable_all_routing ;;
+    esac
     ;;
   stop)
     /usr/local/bin/warp-google stop || true
@@ -1463,23 +1504,32 @@ case "\${1:-}" in
     warp_cli disconnect || true
     sleep 1
     warp_cli connect || true
-    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
-      apply_smart_routing
-    else
-      /usr/local/bin/warp-google restart
-    fi
+    case "\$(routing_mode)" in
+      gemini-only) apply_smart_routing ;;
+      google-all) /usr/local/bin/warp-google restart ;;
+      direct) disable_all_routing ;;
+    esac
     ;;
   test)
     proxy="socks5h://127.0.0.1:\${WARP_PROXY_PORT}"
-    echo "=== 直连测试 ==="
-    test_http "Google Search" "https://www.google.com/generate_204" || true
+    mode="\$(routing_mode)"
+    echo "=== 当前路由测试 (\${mode}) ==="
+    case "\${mode}" in
+      google-all)
+        test_http "Google Search (WARP)" "https://www.google.com/generate_204" || true
+        test_http "Gemini (WARP)" "https://gemini.google.com" || true
+        ;;
+      gemini-only)
+        test_http "Google Search (直连)" "https://www.google.com/generate_204" || true
+        test_http "Gemini (WARP)" "https://gemini.google.com" "\${proxy}" || true
+        ;;
+      direct)
+        test_http "Google Search (直连)" "https://www.google.com/generate_204" || true
+        test_http "Gemini (直连)" "https://gemini.google.com" || true
+        ;;
+    esac
     test_http "ChatGPT" "https://chatgpt.com/cdn-cgi/trace" || true
     test_http "OpenAI API" "https://api.openai.com/cdn-cgi/trace" || true
-    echo
-    echo "=== WARP 测试 ==="
-    test_http "Gemini" "https://gemini.google.com" "\${proxy}" || true
-    test_http "AI Studio" "https://aistudio.google.com" "\${proxy}" || true
-    test_http "Gemini API" "https://generativelanguage.googleapis.com" "\${proxy}" || true
     echo
     echo "=== WARP Trace ==="
     curl -s --max-time 10 -x "\${proxy}" https://www.cloudflare.com/cdn-cgi/trace |
@@ -1494,12 +1544,14 @@ case "\${1:-}" in
     echo
     ;;
   update)
-    if [[ "\$(routing_mode)" == "gemini-only" ]]; then
-      "\${SINGBOX_PATCHER}" apply
-    else
-      /usr/local/bin/warp-google update
-      /usr/local/bin/warp-google restart
-    fi
+    case "\$(routing_mode)" in
+      gemini-only) "\${SINGBOX_PATCHER}" apply ;;
+      google-all)
+        /usr/local/bin/warp-google update
+        /usr/local/bin/warp-google restart
+        ;;
+      direct) disable_all_routing ;;
+    esac
     ;;
   mode)
     case "\${2:-}" in
@@ -1513,21 +1565,28 @@ case "\${1:-}" in
         enable_legacy_routing
         echo "[warp] 已切换为整个 Google IP 段走 WARP"
         ;;
+      direct)
+        echo "direct" > "\${MODE_FILE}"
+        disable_all_routing
+        echo "[warp] 已切换为 Google 与 Gemini 全直连"
+        ;;
       *)
         echo "当前模式: \$(routing_mode)"
-        echo "用法: warp mode {gemini-only|google-all}"
+        echo "用法: warp mode {google-all|gemini-only|direct}"
         ;;
     esac
     ;;
   netflix)
     case "\${2:-}" in
       on|off)
-        [[ "\$(routing_mode)" == "gemini-only" ]] || {
-          echo "[warp] Netflix 域名开关仅适用于 gemini-only 模式" >&2
-          exit 1
-        }
         echo "\${2}" > "\${NETFLIX_MODE_FILE}"
-        apply_smart_routing
+        case "\$(routing_mode)" in
+          gemini-only) apply_smart_routing ;;
+          google-all) /usr/local/bin/warp-google restart ;;
+          direct)
+            echo "[warp] direct 模式不接管 Netflix；设置已保存，切换模式后生效"
+            ;;
+        esac
         echo "[warp] Netflix WARP: \${2}"
         ;;
       test)
@@ -1736,22 +1795,37 @@ do_install() {
   configure_warp
 
   requested_mode="${WARP_ROUTING_MODE:-$(cat "${ROUTING_MODE_FILE}" 2>/dev/null || true)}"
-  [[ -n "${requested_mode}" ]] || requested_mode="gemini-only"
+  [[ -n "${requested_mode}" ]] || requested_mode="google-all"
+  case "${requested_mode}" in
+    google-all|gemini-only|direct) ;;
+    *)
+      warn "未知路由模式 ${requested_mode}，改用 google-all"
+      requested_mode="google-all"
+      ;;
+  esac
 
-  if [[ "${requested_mode}" == "gemini-only" ]] && config_path="$(detect_singbox_config)"; then
+  if config_path="$(detect_singbox_config)"; then
     backup_path="${config_path}.bak-warp-v2-$(date +%Y%m%d-%H%M%S)"
     cp -a "${config_path}" "${backup_path}"
     info "sing-box 配置备份: ${backup_path}"
-    configure_singbox_routing
-  else
-    warn "未启用 sing-box 域名分流，使用 google-all 兼容模式"
-    echo "google-all" > "${ROUTING_MODE_FILE}"
-    "${SINGBOX_PATCHER}" remove 2>/dev/null || true
-    systemctl enable --now redsocks.service >/dev/null 2>&1 || true
-    systemctl enable warp-google.service >/dev/null 2>&1 || true
-    /usr/local/bin/warp-google update || warn "IP 段更新失败，使用静态列表"
-    /usr/local/bin/warp-google start || true
+    prepare_singbox_integration
+  elif [[ "${requested_mode}" == "gemini-only" ]]; then
+    warn "未检测到 sing-box，gemini-only 不可用，改用 google-all"
+    requested_mode="google-all"
   fi
+
+  case "${requested_mode}" in
+    gemini-only)
+      configure_singbox_routing
+      ;;
+    google-all)
+      echo "google-all" > "${ROUTING_MODE_FILE}"
+      /usr/local/bin/warp mode google-all
+      ;;
+    direct)
+      configure_direct_routing
+      ;;
+  esac
 
   echo
   success "安装完成"
